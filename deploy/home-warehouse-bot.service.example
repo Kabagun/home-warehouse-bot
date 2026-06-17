@@ -1,0 +1,14 @@
+[Unit]
+Description=Home Warehouse Telegram Bot
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/bots/home-warehouse-bot/app
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+ExecStart=/srv/bots/home-warehouse-bot/app/.venv/bin/python /srv/bots/home-warehouse-bot/app/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

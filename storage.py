@@ -571,6 +571,33 @@ class Storage:
                 )
                 return self._get_item(connection, item_id)
 
+    def rename_item(self, store_id: int, chat_id: int, item_id: int, name: str) -> InventoryItem | None:
+        clean_name = " ".join(name.split())
+        if not clean_name:
+            return None
+        normalized_name = normalize_name(clean_name)
+        with closing(self._connect()) as connection:
+            with connection:
+                item = self._get_item(connection, item_id)
+                if item is None or item.store_id != store_id:
+                    return None
+                try:
+                    connection.execute(
+                        """
+                        UPDATE inventory_items
+                        SET name = ?, normalized_name = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (clean_name, normalized_name, item_id),
+                    )
+                except sqlite3.IntegrityError:
+                    return None
+                connection.execute(
+                    "INSERT INTO item_events (item_id, chat_id, action, note) VALUES (?, ?, 'rename', ?)",
+                    (item_id, chat_id, f"{item.name} -> {clean_name}"),
+                )
+                return self._get_item(connection, item_id)
+
     def deactivate_item(self, store_id: int, item_id: int) -> bool:
         with closing(self._connect()) as connection:
             with connection:

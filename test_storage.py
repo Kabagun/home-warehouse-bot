@@ -96,6 +96,33 @@ def test_hide_item_and_readd_starts_from_new_quantity(tmp_path: Path) -> None:
     assert new_item.quantity == 2
 
 
+def test_rename_item(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "inventory.sqlite3")
+    user = storage.record_user(1, "anna", "Anna")
+    storage.create_household(user.chat_id, "Дом")
+    store = storage.current_store(user.chat_id)
+
+    item = storage.add_or_update_item(store.id, user.chat_id, "Миг", 8, "табл", None)
+    renamed = storage.rename_item(store.id, user.chat_id, item.id, "Миг 400")
+
+    assert renamed is not None
+    assert renamed.name == "Миг 400"
+    assert storage.find_item(store.id, "Миг 400").id == item.id
+
+
+def test_rename_item_rejects_duplicate_name(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "inventory.sqlite3")
+    user = storage.record_user(1, "anna", "Anna")
+    storage.create_household(user.chat_id, "Дом")
+    store = storage.current_store(user.chat_id)
+
+    mig = storage.add_or_update_item(store.id, user.chat_id, "Миг", 8, "табл", None)
+    storage.add_or_update_item(store.id, user.chat_id, "Нурофен", 1, "шт", None)
+
+    assert storage.rename_item(store.id, user.chat_id, mig.id, "Нурофен") is None
+    assert storage.find_item(store.id, "Миг").id == mig.id
+
+
 def test_format_quantity() -> None:
     assert format_quantity(1.0) == "1"
     assert format_quantity(1.5) == "1.5"

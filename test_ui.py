@@ -8,10 +8,13 @@ from inventory_bot import (
     archived_item_panel,
     buy_panel,
     build_app,
+    handle_flow_text,
     has_explicit_amount_unit,
+    item_create_prompt,
     item_panel,
     item_settings_panel,
     main_menu,
+    parse_amount_list,
     refresh_household_views,
     store_panel,
 )
@@ -43,6 +46,26 @@ def test_quick_amount_without_unit_inherits_existing_item_unit() -> None:
     assert not has_explicit_amount_unit("корм 2 мин 500г")
     assert has_explicit_amount_unit("Миг 2табл")
     assert has_explicit_amount_unit("корм 1,5 кг")
+
+
+def test_new_item_form_accepts_multiline_list_with_optional_plus() -> None:
+    parsed, errors = parse_amount_list("Миг 8табл\n\n+ корм 4,5кг мин 500г\n2 кг")
+
+    assert errors == [(4, "Сначала напишите название, потом количество.")]
+    assert [(line, item.name, item.quantity, item.unit) for line, item in parsed] == [
+        (1, "Миг", 8, "табл"),
+        (3, "корм", 4.5, "кг"),
+    ]
+
+
+def test_new_item_prompt_stays_ready_for_more_items(tmp_path: Path) -> None:
+    _, _, _, _, store = make_shared_storage(tmp_path)
+
+    text = item_create_prompt(store, ["Миг", "Корм"], [(3, "«Бумага» уже есть на складе.")])
+
+    assert "Добавлено: 2" in text
+    assert "Отправьте одну позицию или список" in text
+    assert "строка 3" in text
 
 
 def test_store_panel_sorts_low_items_first_and_paginates(tmp_path: Path) -> None:
@@ -128,6 +151,34 @@ class FakeContext:
     def __init__(self, storage: Storage) -> None:
         self.application = FakeApplication(storage)
         self.bot = FakeBot()
+        self.user_data: dict[str, object] = {}
+
+
+def test_item_create_flow_adds_lists_and_remains_open(tmp_path: Path) -> None:
+    storage, anna, _, home, store = make_shared_storage(tmp_path)
+    context = FakeContext(storage)
+    flow: dict[str, object] = {
+        "mode": "item_create",
+        "message_id": 55,
+        "household_id": home.id,
+        "store_id": store.id,
+        "page": 0,
+        "return_view": "store",
+    }
+    context.user_data["flow"] = flow
+    update = type("FakeUpdate", (), {"effective_chat": type("FakeChat", (), {"id": anna.chat_id})()})()
+
+    asyncio.run(handle_flow_text(update, context, storage, anna, flow, "Миг 8табл\nКорм 4,5кг"))
+
+    assert context.user_data["flow"] == flow
+    assert {item.name for item in storage.list_items(store.id)} == {"Миг", "Корм"}
+    assert "Добавлено: 2" in str(context.bot.edits[-1]["text"])
+
+    asyncio.run(handle_flow_text(update, context, storage, anna, flow, "Миг 2табл\nБумага 4"))
+
+    assert storage.find_item(store.id, "Миг").quantity == 8
+    assert storage.find_item(store.id, "Бумага").quantity == 4
+    assert "уже есть на складе" in str(context.bot.edits[-1]["text"])
 
 
 def test_shared_store_views_refresh_without_new_messages(tmp_path: Path) -> None:

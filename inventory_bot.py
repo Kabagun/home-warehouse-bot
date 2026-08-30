@@ -21,7 +21,7 @@ from telegram.ext import (
     filters,
 )
 
-from storage import ActiveView, Household, InventoryItem, Storage, Store, User, format_quantity
+from storage import ActiveView, Household, InventoryItem, Storage, Store, User, format_quantity, normalize_name
 
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
@@ -196,6 +196,24 @@ def parse_amount_text(text: str) -> ParsedAmount:
     return ParsedAmount(name, quantity, unit, min_quantity, min_unit)
 
 
+def parse_amount_list(text: str) -> tuple[list[tuple[int, ParsedAmount]], list[tuple[int, str]]]:
+    parsed_lines: list[tuple[int, ParsedAmount]] = []
+    errors: list[tuple[int, str]] = []
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("+"):
+            line = line[1:].strip()
+        try:
+            parsed_lines.append((line_number, parse_amount_text(line)))
+        except ValueError as exc:
+            errors.append((line_number, str(exc)))
+    if not parsed_lines and not errors:
+        errors.append((1, "Введите название и количество."))
+    return parsed_lines, errors
+
+
 def parse_quantity_with_optional_unit(text: str, default_unit: str) -> tuple[float, str]:
     cleaned = " ".join(text.strip().split())
     match = re.fullmatch(r"(\d+(?:[.,]\d+)?)\s*([^\d\s]+)?", cleaned, re.IGNORECASE)
@@ -291,6 +309,8 @@ def help_text() -> str:
         "<b>Работа со складом</b>\n"
         "Откройте склад, выберите товар и используйте кнопки «Списать» или «Добавить». "
         "Для существующей позиции достаточно написать количество: <code>2</code>, <code>2табл</code> или <code>500г</code>.\n\n"
+        "Кнопка «Новая позиция» принимает один товар или список — каждый товар с новой строки. "
+        "После добавления форма остаётся открытой для следующих позиций.\n\n"
         "<b>Быстрый ввод</b>\n"
         "<code>+ Бумага 8</code> — добавить 8 штук\n"
         "<code>- Бумага 3</code> — списать 3 штуки\n"
@@ -652,6 +672,41 @@ def cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="v2:flow_cancel")]])
 
 
+def item_create_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="v2:flow_cancel")]])
+
+
+def item_create_prompt(
+    store: Store,
+    added_names: list[str] | None = None,
+    problems: list[tuple[int, str]] | None = None,
+) -> str:
+    parts = [f"<b>Новая позиция · {html.escape(store.name)}</b>"]
+    added_names = added_names or []
+    problems = problems or []
+    if added_names:
+        parts.append(f"Добавлено: {len(added_names)}")
+        parts.extend(f"• {html.escape(name)}" for name in added_names[:8])
+        if len(added_names) > 8:
+            parts.append(f"• и ещё {len(added_names) - 8}")
+    if problems:
+        problem_lines = ["Не добавлено:"]
+        problem_lines.extend(
+            f"• строка {line_number}: {html.escape(reason)}"
+            for line_number, reason in problems[:8]
+        )
+        if len(problems) > 8:
+            problem_lines.append(f"• и ещё {len(problems) - 8}")
+        parts.append("\n".join(problem_lines))
+    parts.append(
+        "Отправьте одну позицию или список — каждый товар с новой строки.\n\n"
+        "<code>Миг 8табл\n"
+        "корм 9кг мин 500г\n"
+        "бумага 4</code>"
+    )
+    return "\n\n".join(parts)
+
+
 async def show_homes_panel(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -863,12 +918,16 @@ async def show_prompt(
     household_id: int | None = None,
     store_id: int | None = None,
     item_id: int | None = None,
+    keyboard: InlineKeyboardMarkup | None = None,
 ) -> int:
+    if keyboard is None:
+        flow = current_flow(context)
+        keyboard = item_create_keyboard() if flow and flow.get("mode") == "item_create" else cancel_keyboard()
     resolved_message_id = await edit_or_send_panel(
         context,
         update.effective_chat.id,
         text,
-        cancel_keyboard(),
+        keyboard,
         view_type="prompt",
         household_id=household_id,
         store_id=store_id,
@@ -1096,24 +1155,45 @@ async def handle_flow_text(
             clear_flow(context)
             await show_stores_panel(update, context, message_id=message_id)
             return
-        try:
-            parsed = parse_amount_text(text)
-        except ValueError as exc:
-            await show_prompt(update, context, f"<b>{html.escape(str(exc))}</b>\n\nНапример: <code>Миг 8табл</code>", message_id=message_id, household_id=store.household_id, store_id=store.id)
-            return
-        existing = next(
-            (candidate for candidate in storage.list_items(store.id, include_inactive=True) if candidate.normalized_name == " ".join(parsed.name.casefold().replace("ё", "е").split())),
-            None,
+        parsed_lines, problems = parse_amount_list(text)
+        existing_items = {
+            item.normalized_name: item
+            for item in storage.list_items(store.id, include_inactive=True)
+        }
+        added_names: list[str] = []
+        for line_number, parsed in parsed_lines:
+            normalized_name = normalize_name(parsed.name)
+            existing = existing_items.get(normalized_name)
+            if existing is not None:
+                location = "в архиве" if not existing.active else "на складе"
+                problems.append((line_number, f"«{existing.name}» уже есть {location}."))
+                continue
+            minimum = minimum_in_item_unit(parsed, parsed.unit)
+            try:
+                item = storage.add_or_update_item(
+                    store.id,
+                    user.chat_id,
+                    parsed.name,
+                    parsed.quantity,
+                    parsed.unit,
+                    minimum,
+                )
+            except (KeyError, ValueError):
+                problems.append((line_number, "Не получилось добавить позицию."))
+                continue
+            existing_items[item.normalized_name] = item
+            added_names.append(item.name)
+        await show_prompt(
+            update,
+            context,
+            item_create_prompt(store, added_names, sorted(problems)),
+            message_id=message_id,
+            household_id=store.household_id,
+            store_id=store.id,
+            keyboard=item_create_keyboard(),
         )
-        if existing is not None:
-            location = "в архиве" if not existing.active else "на складе"
-            await show_prompt(update, context, f"Позиция «{html.escape(existing.name)}» уже есть {location}.", message_id=message_id, household_id=store.household_id, store_id=store.id)
-            return
-        minimum = minimum_in_item_unit(parsed, parsed.unit)
-        item = storage.add_or_update_item(store.id, user.chat_id, parsed.name, parsed.quantity, parsed.unit, minimum)
-        clear_flow(context)
-        await show_item_panel(update, context, item.id, page, message_id=message_id)
-        await refresh_household_views(context, item.household_id)
+        if added_names:
+            await refresh_household_views(context, store.household_id)
         return
 
     if item_id is None:
@@ -1506,9 +1586,7 @@ async def handle_v2_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 update,
                 context,
                 "item_create",
-                "Напишите название и количество новой позиции.\n\n"
-                "<code>Миг 8табл</code>\n"
-                "<code>корм 9кг мин 500г</code>",
+                item_create_prompt(store),
                 message_id=message_id,
                 household_id=store.household_id,
                 store_id=store.id,

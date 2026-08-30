@@ -512,7 +512,7 @@ def help_text() -> str:
         "<code>+ корм 9кг</code> — добавить вес\n"
         "<code>- корм 2,5кг</code> — списать вес\n"
         "\n"
-        "<code>-- горох</code> — скрыть позицию, если покупать не надо\n"
+        "<code>&#45;&#45; горох</code> — скрыть позицию, если покупать не надо\n"
         "<code>+ корм 9кг мин 500г</code> — добавить 9кг корма с минимумом 500г\n\n"
         "По умолчанию минимум равен 1: если осталось 1 или 0, позиция попадает в список «Купить». "
         "Когда количество становится меньше или равно минимуму, бот периодически напоминает участникам склада."
@@ -560,6 +560,15 @@ def parse_amount_text(text: str) -> ParsedAmount:
     unit_parts.extend(tokens[amount_index + 1 :])
     unit = normalize_unit(" ".join(unit_parts).strip() or "шт")
     return ParsedAmount(name, quantity, unit, min_quantity, min_unit)
+
+
+def hidden_item_name(text: str) -> str | None:
+    stripped = text.lstrip()
+    if stripped.startswith("--"):
+        return stripped[2:].strip()
+    if stripped.startswith(("—", "–")):
+        return stripped[1:].strip()
+    return None
 
 
 def looks_like_number(value: str) -> bool:
@@ -917,13 +926,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         await adjust_item_from_text(update, context, state, text)
         return
-    if text.startswith("--"):
+    hidden_name = hidden_item_name(text)
+    if hidden_name is not None:
         store = storage.current_store(user.chat_id)
         if store is None:
             await prompt_no_store(update, context)
             return
         try:
-            await hide_item_from_text(update, context, store, text[2:].strip())
+            await hide_item_from_text(update, context, store, hidden_name)
         except Exception:
             LOGGER.exception("Failed to hide inventory item")
             await update.message.reply_text("Не получилось скрыть позицию. Я записала ошибку в лог.")
@@ -953,11 +963,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     await update.message.reply_text(
         "Я не совсем понял. Для быстрого ввода используйте, например:\n"
-        "+ Миг 8\n"
-        "+ Миг 8табл\n"
-        "- Миг 2табл\n"
-        "-- горох",
+        "<code>+ Миг 8</code>\n"
+        "<code>+ Миг 8табл</code>\n"
+        "<code>- Миг 2табл</code>\n"
+        "<code>&#45;&#45; горох</code>",
         reply_markup=main_menu(),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -1033,7 +1044,10 @@ async def hide_item_from_text(
 ) -> None:
     name = " ".join(text.split())
     if not name:
-        await update.message.reply_text("Напишите, что скрыть. Например: -- горох")
+        await update.message.reply_text(
+            "Напишите, что скрыть. Например: <code>&#45;&#45; горох</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
     storage: Storage = context.application.bot_data["storage"]
     item = storage.find_item(store.id, name)

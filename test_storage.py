@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from bot import convert_quantity, parse_amount_text
+from bot import convert_quantity, hidden_item_name, parse_amount_text
 from storage import Storage, format_quantity
 
 
@@ -143,3 +143,10 @@ def test_convert_compatible_units() -> None:
     assert convert_quantity(2.5, "кг", "г") == 2500
     assert convert_quantity(500, "мл", "л") == 0.5
     assert convert_quantity(1, "шт", "кг") is None
+
+
+def test_hide_command_accepts_smart_dashes() -> None:
+    assert hidden_item_name("-- горох") == "горох"
+    assert hidden_item_name("— горох") == "горох"
+    assert hidden_item_name("– горох") == "горох"
+    assert hidden_item_name("- горох 1") is None

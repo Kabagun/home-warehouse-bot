@@ -739,6 +739,22 @@ class Storage:
                 )
                 return self._get_item(connection, item_id)
 
+    def delete_item(self, store_id: int, chat_id: int, item_id: int) -> bool:
+        with closing(self._connect()) as connection:
+            with connection:
+                item = self._get_item(connection, item_id)
+                if (
+                    item is None
+                    or item.store_id != store_id
+                    or not self._is_member(connection, item.household_id, chat_id)
+                ):
+                    return False
+                cursor = connection.execute(
+                    "DELETE FROM inventory_items WHERE id = ? AND store_id = ?",
+                    (item_id, store_id),
+                )
+                return cursor.rowcount > 0
+
     def deactivate_item(self, store_id: int, item_id: int) -> bool:
         with closing(self._connect()) as connection:
             with connection:

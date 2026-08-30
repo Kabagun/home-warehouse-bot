@@ -579,6 +579,7 @@ def item_settings_panel(item: InventoryItem, page: int) -> tuple[str, InlineKeyb
                 ],
                 [InlineKeyboardButton("Единица", callback_data=f"v2:item_unit:{item.id}:{page}")],
                 [InlineKeyboardButton("В архив", callback_data=f"v2:item_archive:{item.id}:{page}")],
+                [InlineKeyboardButton("Удалить", callback_data=f"v2:item_delete:{item.id}:{page}:item")],
                 [InlineKeyboardButton("Назад", callback_data=f"v2:item:{item.id}:{page}")],
             ]
         ),
@@ -620,6 +621,7 @@ def archived_item_panel(item: InventoryItem, page: int) -> tuple[str, InlineKeyb
         InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("Восстановить", callback_data=f"v2:item_restore:{item.id}:{page}")],
+                [InlineKeyboardButton("Удалить", callback_data=f"v2:item_delete:{item.id}:{page}:archive")],
                 [InlineKeyboardButton("Назад", callback_data=f"v2:archive:{item.store_id}:{page}")],
             ]
         ),
@@ -1634,6 +1636,78 @@ async def handle_v2_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await refresh_household_views(context, item.household_id)
             else:
                 await show_stores_panel(update, context, message_id=message_id)
+            return
+        if data.startswith("v2:item_delete:"):
+            parts = data.split(":")
+            item = accessible_item(storage, user, int(parts[2]))
+            page = int(parts[3])
+            return_view = parts[4]
+            if item is None:
+                await show_stores_panel(update, context, message_id=message_id)
+                return
+            cancel_callback = (
+                f"v2:archived:{item.id}:{page}"
+                if return_view == "archive"
+                else f"v2:item_settings:{item.id}:{page}"
+            )
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Да, удалить",
+                            callback_data=f"v2:item_delete_yes:{item.id}:{page}:{return_view}",
+                        ),
+                        InlineKeyboardButton("Отмена", callback_data=cancel_callback),
+                    ]
+                ]
+            )
+            await edit_or_send_panel(
+                context,
+                user.chat_id,
+                f"Удалить позицию «{html.escape(item.name)}»?\n\n"
+                "Она будет удалена без возможности восстановления.",
+                keyboard,
+                view_type="archive" if return_view == "archive" else "item",
+                household_id=item.household_id,
+                store_id=item.store_id,
+                item_id=item.id,
+                page=page,
+                message_id=message_id,
+            )
+            return
+        if data.startswith("v2:item_delete_yes:"):
+            parts = data.split(":")
+            item = accessible_item(storage, user, int(parts[2]))
+            page = int(parts[3])
+            return_view = parts[4]
+            if item is None:
+                await show_stores_panel(update, context, message_id=message_id)
+                return
+            household_id = item.household_id
+            store_id = item.store_id
+            if not storage.delete_item(store_id, user.chat_id, item.id):
+                await show_stores_panel(update, context, message_id=message_id)
+                return
+            if return_view == "archive":
+                store = storage.get_store(store_id)
+                if store is None:
+                    await show_stores_panel(update, context, message_id=message_id)
+                else:
+                    text, keyboard, safe_page = archive_panel(storage, store, page)
+                    await edit_or_send_panel(
+                        context,
+                        user.chat_id,
+                        text,
+                        keyboard,
+                        view_type="archive",
+                        household_id=household_id,
+                        store_id=store_id,
+                        page=safe_page,
+                        message_id=message_id,
+                    )
+            else:
+                await show_store_panel(update, context, store_id, page, message_id=message_id)
+            await refresh_household_views(context, household_id)
             return
         if data.startswith("v2:archive:"):
             parts = data.split(":")

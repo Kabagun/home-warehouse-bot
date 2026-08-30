@@ -177,6 +177,22 @@ def test_archive_restore_and_unit_change(tmp_path: Path) -> None:
     assert restored.min_quantity == 500
 
 
+def test_delete_item_permanently_removes_active_and_archived_items(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "inventory.sqlite3")
+    user = storage.record_user(1, "anna", "Anna")
+    storage.create_household(user.chat_id, "Дом")
+    store = storage.current_store(user.chat_id)
+    active = storage.add_or_update_item(store.id, user.chat_id, "Миг", 8, "табл", 1)
+    archived = storage.add_or_update_item(store.id, user.chat_id, "Горох", 0, "шт", 1)
+    storage.archive_item(store.id, user.chat_id, archived.id)
+
+    assert storage.delete_item(store.id, user.chat_id, active.id)
+    assert storage.delete_item(store.id, user.chat_id, archived.id)
+    assert storage.get_item(active.id) is None
+    assert storage.get_item(archived.id) is None
+    assert storage.list_items(store.id, include_inactive=True) == []
+
+
 def test_quantity_change_is_clamped_and_active_view_is_persisted(tmp_path: Path) -> None:
     storage = Storage(tmp_path / "inventory.sqlite3")
     user = storage.record_user(1, "anna", "Anna")
@@ -228,6 +244,7 @@ def test_former_member_cannot_change_items_from_stale_buttons(tmp_path: Path) ->
     assert storage.remove_household_for_user(member.chat_id, home.id) == "left"
     assert storage.change_item_quantity(store.id, member.chat_id, item.id, -1) is None
     assert storage.archive_item(store.id, member.chat_id, item.id) is None
+    assert not storage.delete_item(store.id, member.chat_id, item.id)
     assert storage.change_item_unit(store.id, member.chat_id, item.id, "шт", 8, 1) is None
     assert storage.get_item(item.id).quantity == 8
 

@@ -5,10 +5,12 @@ from pathlib import Path
 
 from inventory_bot import (
     Settings,
+    archived_item_panel,
     buy_panel,
     build_app,
     has_explicit_amount_unit,
     item_panel,
+    item_settings_panel,
     main_menu,
     refresh_household_views,
     store_panel,
@@ -69,6 +71,22 @@ def test_item_panel_contains_only_context_actions_and_back(tmp_path: Path) -> No
 
     assert "Остаток: 8 табл" in text
     assert labels == [["−1", "+1"], ["Списать", "Добавить"], ["Настройки"], ["Назад"]]
+
+
+def test_item_settings_and_archive_offer_permanent_delete(tmp_path: Path) -> None:
+    storage, anna, _, _, store = make_shared_storage(tmp_path)
+    item = storage.add_or_update_item(store.id, anna.chat_id, "Миг", 8, "табл", 1)
+
+    _, settings_keyboard = item_settings_panel(item, 0)
+    storage.archive_item(store.id, anna.chat_id, item.id)
+    archived = storage.get_item(item.id)
+    _, archived_keyboard = archived_item_panel(archived, 0)
+
+    settings_labels = [[button.text for button in row] for row in settings_keyboard.inline_keyboard]
+    archived_labels = [[button.text for button in row] for row in archived_keyboard.inline_keyboard]
+
+    assert ["Удалить"] in settings_labels
+    assert ["Удалить"] in archived_labels
 
 
 def test_buy_panel_groups_all_stores_as_buttons(tmp_path: Path) -> None:

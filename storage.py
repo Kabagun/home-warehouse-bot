@@ -50,8 +50,19 @@ class User:
     first_name: str | None
     current_household_id: int | None
     current_store_id: int | None
-    reminders_enabled: bool
     last_seen: str | None
+
+
+@dataclass(frozen=True)
+class ActiveView:
+    chat_id: int
+    message_id: int
+    view_type: str
+    household_id: int | None
+    store_id: int | None
+    item_id: int | None
+    page: int
+    updated_at: str
 
 
 def normalize_name(value: str) -> str:
@@ -71,7 +82,7 @@ class Storage:
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
@@ -147,6 +158,20 @@ class Storage:
                     """
                 )
                 self._migrate_item_events_fk(connection)
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS active_views (
+                        chat_id INTEGER PRIMARY KEY,
+                        message_id INTEGER NOT NULL,
+                        view_type TEXT NOT NULL,
+                        household_id INTEGER,
+                        store_id INTEGER,
+                        item_id INTEGER,
+                        page INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
                 self._ensure_default_stores(connection)
 
     def record_user(self, chat_id: int, username: str | None, first_name: str | None) -> User:
@@ -308,6 +333,7 @@ class Storage:
                 if member is None:
                     return None
                 if member["role"] == "owner":
+                    connection.execute("DELETE FROM active_views WHERE household_id = ?", (household_id,))
                     connection.execute("DELETE FROM households WHERE id = ?", (household_id,))
                     connection.execute(
                         """
@@ -319,6 +345,10 @@ class Storage:
                     )
                     action = "deleted"
                 else:
+                    connection.execute(
+                        "DELETE FROM active_views WHERE household_id = ? AND chat_id = ?",
+                        (household_id, chat_id),
+                    )
                     connection.execute(
                         "DELETE FROM household_members WHERE household_id = ? AND chat_id = ?",
                         (household_id, chat_id),
@@ -375,6 +405,18 @@ class Storage:
                 (household_id,),
             ).fetchall()
             return [self._row_to_user(row) for row in rows]
+
+    def household_role(self, household_id: int, chat_id: int) -> str | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT role FROM household_members WHERE household_id = ? AND chat_id = ?",
+                (household_id, chat_id),
+            ).fetchone()
+            return str(row["role"]) if row else None
+
+    def is_household_member(self, household_id: int, chat_id: int) -> bool:
+        with closing(self._connect()) as connection:
+            return self._is_member(connection, household_id, chat_id)
 
     def list_stores(self, household_id: int) -> list[Store]:
         with closing(self._connect()) as connection:
@@ -483,7 +525,7 @@ class Storage:
         with closing(self._connect()) as connection:
             with connection:
                 store = self._get_store(connection, store_id)
-                if store is None:
+                if store is None or not self._is_member(connection, store.household_id, chat_id):
                     raise KeyError(f"Store {store_id} does not exist")
                 connection.execute(
                     """
@@ -503,7 +545,6 @@ class Storage:
                             ELSE excluded.min_quantity
                         END,
                         active = 1,
-                        last_reminded_at = NULL,
                         updated_at = CURRENT_TIMESTAMP
                     """,
                     (store.household_id, store_id, clean_name, normalized_name, quantity, clean_unit, minimum, min_quantity),
@@ -519,17 +560,20 @@ class Storage:
         with closing(self._connect()) as connection:
             with connection:
                 item = self._get_item(connection, item_id)
-                if item is None or item.store_id != store_id:
+                if (
+                    item is None
+                    or item.store_id != store_id
+                    or not self._is_member(connection, item.household_id, chat_id)
+                ):
                     return None
                 delta = quantity - item.quantity
                 connection.execute(
                     """
                     UPDATE inventory_items
-                    SET quantity = ?, active = 1, updated_at = CURRENT_TIMESTAMP,
-                        last_reminded_at = CASE WHEN ? > min_quantity THEN NULL ELSE last_reminded_at END
+                    SET quantity = ?, active = 1, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (quantity, quantity, item_id),
+                    (quantity, item_id),
                 )
                 connection.execute(
                     "INSERT INTO item_events (item_id, chat_id, action, delta) VALUES (?, ?, 'set_quantity', ?)",
@@ -541,29 +585,45 @@ class Storage:
         with closing(self._connect()) as connection:
             with connection:
                 item = self._get_item(connection, item_id)
-                if item is None or item.store_id != store_id:
+                if (
+                    item is None
+                    or item.store_id != store_id
+                    or not self._is_member(connection, item.household_id, chat_id)
+                ):
                     return None
-                new_quantity = max(0.0, item.quantity + delta)
-                connection.execute(
+                row = connection.execute(
                     """
                     UPDATE inventory_items
-                    SET quantity = ?, updated_at = CURRENT_TIMESTAMP,
-                        last_reminded_at = CASE WHEN ? > min_quantity THEN NULL ELSE last_reminded_at END
-                    WHERE id = ?
+                    SET quantity = MAX(0.0, quantity + ?),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND store_id = ?
+                    RETURNING *
                     """,
-                    (new_quantity, new_quantity, item_id),
-                )
+                    (delta, item_id, store_id),
+                ).fetchone()
+                if row is None:
+                    return None
                 connection.execute(
                     "INSERT INTO item_events (item_id, chat_id, action, delta) VALUES (?, ?, 'change_quantity', ?)",
                     (item_id, chat_id, delta),
                 )
-                return self._get_item(connection, item_id)
+                return self._row_to_item(row)
 
-    def set_item_minimum(self, store_id: int, item_id: int, min_quantity: float) -> InventoryItem | None:
+    def set_item_minimum(
+        self,
+        store_id: int,
+        item_id: int,
+        min_quantity: float,
+        chat_id: int | None = None,
+    ) -> InventoryItem | None:
         with closing(self._connect()) as connection:
             with connection:
                 item = self._get_item(connection, item_id)
-                if item is None or item.store_id != store_id:
+                if (
+                    item is None
+                    or item.store_id != store_id
+                    or (chat_id is not None and not self._is_member(connection, item.household_id, chat_id))
+                ):
                     return None
                 connection.execute(
                     "UPDATE inventory_items SET min_quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -579,7 +639,11 @@ class Storage:
         with closing(self._connect()) as connection:
             with connection:
                 item = self._get_item(connection, item_id)
-                if item is None or item.store_id != store_id:
+                if (
+                    item is None
+                    or item.store_id != store_id
+                    or not self._is_member(connection, item.household_id, chat_id)
+                ):
                     return None
                 try:
                     connection.execute(
@@ -598,6 +662,83 @@ class Storage:
                 )
                 return self._get_item(connection, item_id)
 
+    def change_item_unit(
+        self,
+        store_id: int,
+        chat_id: int,
+        item_id: int,
+        unit: str,
+        quantity: float,
+        min_quantity: float,
+    ) -> InventoryItem | None:
+        clean_unit = " ".join(unit.split())
+        if not clean_unit or quantity < 0 or min_quantity < 0:
+            return None
+        with closing(self._connect()) as connection:
+            with connection:
+                item = self._get_item(connection, item_id)
+                if (
+                    item is None
+                    or item.store_id != store_id
+                    or not self._is_member(connection, item.household_id, chat_id)
+                ):
+                    return None
+                connection.execute(
+                    """
+                    UPDATE inventory_items
+                    SET unit = ?, quantity = ?, min_quantity = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND store_id = ?
+                    """,
+                    (clean_unit, quantity, min_quantity, item_id, store_id),
+                )
+                connection.execute(
+                    "INSERT INTO item_events (item_id, chat_id, action, note) VALUES (?, ?, 'change_unit', ?)",
+                    (item_id, chat_id, f"{item.unit} -> {clean_unit}"),
+                )
+                return self._get_item(connection, item_id)
+
+    def archive_item(self, store_id: int, chat_id: int, item_id: int) -> InventoryItem | None:
+        with closing(self._connect()) as connection:
+            with connection:
+                item = self._get_item(connection, item_id)
+                if (
+                    item is None
+                    or item.store_id != store_id
+                    or not item.active
+                    or not self._is_member(connection, item.household_id, chat_id)
+                ):
+                    return None
+                connection.execute(
+                    "UPDATE inventory_items SET active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (item_id,),
+                )
+                connection.execute(
+                    "INSERT INTO item_events (item_id, chat_id, action) VALUES (?, ?, 'archive')",
+                    (item_id, chat_id),
+                )
+                return self._get_item(connection, item_id)
+
+    def restore_item(self, store_id: int, chat_id: int, item_id: int) -> InventoryItem | None:
+        with closing(self._connect()) as connection:
+            with connection:
+                item = self._get_item(connection, item_id)
+                if (
+                    item is None
+                    or item.store_id != store_id
+                    or item.active
+                    or not self._is_member(connection, item.household_id, chat_id)
+                ):
+                    return None
+                connection.execute(
+                    "UPDATE inventory_items SET active = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (item_id,),
+                )
+                connection.execute(
+                    "INSERT INTO item_events (item_id, chat_id, action) VALUES (?, ?, 'restore')",
+                    (item_id, chat_id),
+                )
+                return self._get_item(connection, item_id)
+
     def deactivate_item(self, store_id: int, item_id: int) -> bool:
         with closing(self._connect()) as connection:
             with connection:
@@ -606,6 +747,14 @@ class Storage:
                     (store_id, item_id),
                 )
                 return cursor.rowcount > 0
+
+    def get_store(self, store_id: int) -> Store | None:
+        with closing(self._connect()) as connection:
+            return self._get_store(connection, store_id)
+
+    def get_item(self, item_id: int) -> InventoryItem | None:
+        with closing(self._connect()) as connection:
+            return self._get_item(connection, item_id)
 
     def list_items(self, store_id: int, include_inactive: bool = False) -> list[InventoryItem]:
         query = "SELECT * FROM inventory_items WHERE store_id = ?"
@@ -671,75 +820,62 @@ class Storage:
             ).fetchall()
             return self._row_to_item(rows[0]) if rows else None
 
-    def reminder_targets(self, reminder_interval_hours: int) -> list[tuple[Household, Store, list[InventoryItem], list[User]]]:
-        with closing(self._connect()) as connection:
-            store_rows = connection.execute(
-                """
-                SELECT DISTINCT s.*
-                FROM stores s
-                JOIN inventory_items i ON i.store_id = s.id
-                WHERE i.active = 1
-                  AND i.quantity <= i.min_quantity
-                  AND (
-                    i.last_reminded_at IS NULL
-                    OR datetime(i.last_reminded_at, '+' || ? || ' hours') <= CURRENT_TIMESTAMP
-                  )
-                ORDER BY s.household_id, s.id
-                """,
-                (reminder_interval_hours,),
-            ).fetchall()
-            result: list[tuple[Household, Store, list[InventoryItem], list[User]]] = []
-            for store_row in store_rows:
-                store = self._row_to_store(store_row)
-                household = self._get_household(connection, store.household_id)
-                item_rows = connection.execute(
-                    """
-                    SELECT *
-                    FROM inventory_items
-                    WHERE store_id = ? AND active = 1 AND quantity <= min_quantity
-                      AND (
-                        last_reminded_at IS NULL
-                        OR datetime(last_reminded_at, '+' || ? || ' hours') <= CURRENT_TIMESTAMP
-                      )
-                    ORDER BY normalized_name
-                    """,
-                    (store.id, reminder_interval_hours),
-                ).fetchall()
-                member_rows = connection.execute(
-                    """
-                    SELECT u.*
-                    FROM users u
-                    JOIN household_members m ON m.chat_id = u.chat_id
-                    WHERE m.household_id = ? AND u.reminders_enabled = 1
-                    ORDER BY u.chat_id
-                    """,
-                    (household.id,),
-                ).fetchall()
-                result.append(
-                    (
-                        household,
-                        store,
-                        [self._row_to_item(row) for row in item_rows],
-                        [self._row_to_user(row) for row in member_rows],
-                    )
-                )
-            return result
-
-    def mark_items_reminded(self, item_ids: list[int]) -> None:
-        if not item_ids:
-            return
-        placeholders = ",".join("?" for _ in item_ids)
+    def set_active_view(
+        self,
+        chat_id: int,
+        message_id: int,
+        view_type: str,
+        *,
+        household_id: int | None = None,
+        store_id: int | None = None,
+        item_id: int | None = None,
+        page: int = 0,
+    ) -> ActiveView:
         with closing(self._connect()) as connection:
             with connection:
                 connection.execute(
-                    f"UPDATE inventory_items SET last_reminded_at = CURRENT_TIMESTAMP WHERE id IN ({placeholders})",
-                    item_ids,
+                    """
+                    INSERT INTO active_views (
+                        chat_id, message_id, view_type, household_id, store_id, item_id, page, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(chat_id) DO UPDATE SET
+                        message_id = excluded.message_id,
+                        view_type = excluded.view_type,
+                        household_id = excluded.household_id,
+                        store_id = excluded.store_id,
+                        item_id = excluded.item_id,
+                        page = excluded.page,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (chat_id, message_id, view_type, household_id, store_id, item_id, max(0, page)),
                 )
+                row = connection.execute("SELECT * FROM active_views WHERE chat_id = ?", (chat_id,)).fetchone()
+                return self._row_to_active_view(row)
 
-    def set_reminders_enabled(self, chat_id: int, enabled: bool) -> None:
+    def get_active_view(self, chat_id: int) -> ActiveView | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute("SELECT * FROM active_views WHERE chat_id = ?", (chat_id,)).fetchone()
+            return self._row_to_active_view(row) if row else None
+
+    def active_views_for_household(self, household_id: int) -> list[ActiveView]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT * FROM active_views WHERE household_id = ? ORDER BY chat_id",
+                (household_id,),
+            ).fetchall()
+            return [self._row_to_active_view(row) for row in rows]
+
+    def clear_active_view(self, chat_id: int, message_id: int | None = None) -> None:
         with closing(self._connect()) as connection:
             with connection:
-                connection.execute("UPDATE users SET reminders_enabled = ? WHERE chat_id = ?", (1 if enabled else 0, chat_id))
+                if message_id is None:
+                    connection.execute("DELETE FROM active_views WHERE chat_id = ?", (chat_id,))
+                else:
+                    connection.execute(
+                        "DELETE FROM active_views WHERE chat_id = ? AND message_id = ?",
+                        (chat_id, message_id),
+                    )
 
     def _migrate_inventory_items(self, connection: sqlite3.Connection) -> None:
         exists = connection.execute(
@@ -989,6 +1125,17 @@ class Storage:
             first_name=row["first_name"],
             current_household_id=row["current_household_id"],
             current_store_id=row["current_store_id"],
-            reminders_enabled=bool(row["reminders_enabled"]),
             last_seen=row["last_seen"],
+        )
+
+    def _row_to_active_view(self, row: sqlite3.Row) -> ActiveView:
+        return ActiveView(
+            chat_id=row["chat_id"],
+            message_id=row["message_id"],
+            view_type=row["view_type"],
+            household_id=row["household_id"],
+            store_id=row["store_id"],
+            item_id=row["item_id"],
+            page=int(row["page"]),
+            updated_at=row["updated_at"],
         )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from bot import convert_quantity, hidden_item_name, parse_amount_text
@@ -150,3 +151,100 @@ def test_hide_command_accepts_smart_dashes() -> None:
     assert hidden_item_name("— горох") == "горох"
     assert hidden_item_name("– горох") == "горох"
     assert hidden_item_name("- горох 1") is None
+
+
+def test_archive_restore_and_unit_change(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "inventory.sqlite3")
+    user = storage.record_user(1, "anna", "Anna")
+    storage.create_household(user.chat_id, "Дом")
+    store = storage.current_store(user.chat_id)
+    item = storage.add_or_update_item(store.id, user.chat_id, "Корм", 4.5, "кг", 0.5)
+
+    converted = storage.change_item_unit(store.id, user.chat_id, item.id, "г", 4500, 500)
+    archived = storage.archive_item(store.id, user.chat_id, item.id)
+
+    assert converted.quantity == 4500
+    assert converted.min_quantity == 500
+    assert converted.unit == "г"
+    assert archived is not None and not archived.active
+    assert storage.list_items(store.id) == []
+    assert storage.list_items(store.id, include_inactive=True)[0].name == "Корм"
+
+    restored = storage.restore_item(store.id, user.chat_id, item.id)
+
+    assert restored is not None and restored.active
+    assert restored.quantity == 4500
+    assert restored.min_quantity == 500
+
+
+def test_quantity_change_is_clamped_and_active_view_is_persisted(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "inventory.sqlite3")
+    user = storage.record_user(1, "anna", "Anna")
+    home = storage.create_household(user.chat_id, "Дом")
+    store = storage.current_store(user.chat_id)
+    item = storage.add_or_update_item(store.id, user.chat_id, "Миг", 1, "табл", 1)
+
+    updated = storage.change_item_quantity(store.id, user.chat_id, item.id, -5)
+    view = storage.set_active_view(
+        user.chat_id,
+        55,
+        "item",
+        household_id=home.id,
+        store_id=store.id,
+        item_id=item.id,
+        page=2,
+    )
+
+    assert updated.quantity == 0
+    assert view.message_id == 55
+    assert storage.get_active_view(user.chat_id) == view
+    assert storage.active_views_for_household(home.id) == [view]
+
+    storage.clear_active_view(user.chat_id, 55)
+
+    assert storage.get_active_view(user.chat_id) is None
+
+
+def test_household_role_distinguishes_delete_from_leave(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "inventory.sqlite3")
+    owner = storage.record_user(1, "anna", "Anna")
+    member = storage.record_user(2, "max", "Max")
+    home = storage.create_household(owner.chat_id, "Дом")
+    storage.join_household(member.chat_id, home.invite_code)
+
+    assert storage.household_role(home.id, owner.chat_id) == "owner"
+    assert storage.household_role(home.id, member.chat_id) == "member"
+
+
+def test_former_member_cannot_change_items_from_stale_buttons(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "inventory.sqlite3")
+    owner = storage.record_user(1, "anna", "Anna")
+    member = storage.record_user(2, "max", "Max")
+    home = storage.create_household(owner.chat_id, "Дом")
+    storage.join_household(member.chat_id, home.invite_code)
+    store = storage.current_store(owner.chat_id)
+    item = storage.add_or_update_item(store.id, owner.chat_id, "Миг", 8, "табл", 1)
+
+    assert storage.remove_household_for_user(member.chat_id, home.id) == "left"
+    assert storage.change_item_quantity(store.id, member.chat_id, item.id, -1) is None
+    assert storage.archive_item(store.id, member.chat_id, item.id) is None
+    assert storage.change_item_unit(store.id, member.chat_id, item.id, "шт", 8, 1) is None
+    assert storage.get_item(item.id).quantity == 8
+
+
+def test_concurrent_quantity_changes_are_not_lost(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "inventory.sqlite3")
+    user = storage.record_user(1, "anna", "Anna")
+    storage.create_household(user.chat_id, "Дом")
+    store = storage.current_store(user.chat_id)
+    item = storage.add_or_update_item(store.id, user.chat_id, "Миг", 0, "табл", 1)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(
+            pool.map(
+                lambda _: storage.change_item_quantity(store.id, user.chat_id, item.id, 1),
+                range(40),
+            )
+        )
+
+    assert storage.get_item(item.id).quantity == 40

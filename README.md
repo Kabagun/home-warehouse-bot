@@ -1,4 +1,4 @@
-# Home Warehouse Bot
+# home-warehouse-bot
 
 Telegram-бот для общего домашнего склада: лекарства, продукты, корм и бытовая химия.
 
@@ -66,7 +66,8 @@ DATABASE_PATH=home_warehouse_bot.sqlite3
 2. Установите зависимости и запустите:
 
 ```powershell
-cd C:\path\to\home-warehouse-bot
+git clone https://github.com/Kabagun/home-warehouse-bot.git
+cd home-warehouse-bot
 python -m venv .venv
 .\.venv\Scripts\pip install -r requirements.txt
 .\.venv\Scripts\python bot.py

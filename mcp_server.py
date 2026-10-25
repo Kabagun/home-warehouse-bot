@@ -1,14 +1,16 @@
-"""Local stdio MCP access to the same SQLite inventory used by Telegram.
+"""Standalone local inventory MCP server and operator-only database setup.
 
-The host chooses one existing bot user through MCP_CHAT_ID. Tool arguments
-cannot select an identity or database. No Telegram token or network listener
-is needed.
+The host binds tools to an existing local identity through MCP_USER_ID.
+MCP_CHAT_ID remains a legacy configuration alias; database identities continue
+to use the existing users.chat_id column. Tools cannot select an identity or
+database, and setup is available only through the explicit init CLI command.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import sqlite3
 import sys
 from collections.abc import Callable, Mapping
@@ -51,49 +53,171 @@ class InventoryMCPServer(MCPServer):
 @dataclass(frozen=True)
 class MCPSettings:
     database_path: Path
-    chat_id: int
+    user_id: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "database_path", database_path(self.database_path))
+        validate_user_id(self.user_id)
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> MCPSettings:
         values = os.environ if environ is None else environ
         raw_path = values.get("DATABASE_PATH", "").strip()
         if not raw_path:
-            raise ConfigurationError("Set DATABASE_PATH to the existing bot SQLite database.")
-        raw_identity = values.get("MCP_CHAT_ID", "").strip()
-        try:
-            chat_id = int(raw_identity)
-        except ValueError:
-            raise ConfigurationError("Set MCP_CHAT_ID to an existing registered bot user's integer ID.") from None
-        if not chat_id or not -(2**63) <= chat_id < 2**63:
-            raise ConfigurationError("MCP_CHAT_ID must be a nonzero signed 64-bit integer.")
-        try:
-            database_path = Path(raw_path).expanduser().resolve()
-        except (OSError, ValueError, RuntimeError):
-            raise ConfigurationError("DATABASE_PATH must be a valid existing bot SQLite file path.") from None
-        return cls(database_path, chat_id)
+            raise ConfigurationError("Set DATABASE_PATH to an initialized inventory SQLite database.")
+        primary = values.get("MCP_USER_ID")
+        legacy = values.get("MCP_CHAT_ID")
+        if primary is None and legacy is None:
+            raise ConfigurationError("Set MCP_USER_ID to an existing registered local user's integer ID.")
+        user_id = parse_user_id(primary if primary is not None else legacy)
+        if legacy is not None and parse_user_id(legacy) != user_id:
+            raise ConfigurationError("MCP_USER_ID and legacy MCP_CHAT_ID must identify the same user.")
+        return cls(database_path(raw_path), user_id)
 
     def open_storage(self) -> Storage:
         """Fail before migrations if the file or registered identity is absent."""
-        if not self.database_path.is_file():
-            raise ConfigurationError("DATABASE_PATH must point to an existing bot SQLite database file.")
-        try:
-            with closing(sqlite3.connect(self.database_path.as_uri() + "?mode=ro", uri=True)) as connection:
-                user = connection.execute("SELECT 1 FROM users WHERE chat_id = ?", (self.chat_id,)).fetchone()
-                required = {"households", "household_members", "inventory_items"}
-                tables = {
-                    row[0]
-                    for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-                }
-                if not required <= tables:
-                    raise ConfigurationError("DATABASE_PATH is not an initialized bot inventory database.")
-        except (sqlite3.Error, OSError):
-            raise ConfigurationError("Cannot read the existing bot inventory database in DATABASE_PATH.") from None
-        if user is None:
-            raise ConfigurationError("MCP_CHAT_ID must identify a user already registered in this bot database.")
+        inspect_database(self.database_path, self.user_id)
         try:
             return Storage(self.database_path)
         except (sqlite3.Error, OSError):
-            raise ConfigurationError("Cannot open or migrate the existing bot inventory database.") from None
+            raise ConfigurationError("Cannot open or migrate the existing inventory database.") from None
+
+
+def parse_user_id(value: str | None) -> int:
+    """Parse configuration without accepting floats, booleans, or separators."""
+    if value is None or re.fullmatch(r"[+-]?[0-9]+", value.strip()) is None:
+        raise ConfigurationError("MCP_USER_ID (or legacy MCP_CHAT_ID) must be a nonzero signed 64-bit integer.")
+    try:
+        user_id = int(value)
+    except ValueError:
+        raise ConfigurationError("MCP_USER_ID must be a nonzero signed 64-bit integer.") from None
+    validate_user_id(user_id)
+    return user_id
+
+
+def validate_user_id(user_id: int) -> None:
+    if type(user_id) is not int or not user_id or not -(2**63) <= user_id < 2**63:
+        raise ConfigurationError("MCP_USER_ID must be a nonzero signed 64-bit integer.")
+
+
+def database_path(value: str | Path) -> Path:
+    try:
+        if not isinstance(value, (str, Path)) or not str(value).strip() or "\0" in str(value):
+            raise ValueError
+        return Path(value).expanduser().resolve()
+    except (OSError, ValueError, RuntimeError):
+        raise ConfigurationError("DATABASE_PATH must be a valid inventory SQLite file path.") from None
+
+
+# Recognize the existing schema and the pre-store inventory revision supported
+# by Storage. Missing auxiliary tables are additive migrations; malformed tables
+# must be rejected before Storage executes any CREATE/ALTER/seed statements.
+_REQUIRED_COLUMNS = {
+    "users": {"chat_id", "username", "first_name", "current_household_id", "reminders_enabled", "created_at", "last_seen"},
+    "households": {"id", "name", "invite_code", "owner_chat_id", "created_at"},
+    "household_members": {"household_id", "chat_id", "role", "joined_at"},
+    "inventory_items": {
+        "id", "household_id", "name", "normalized_name", "quantity", "unit", "min_quantity", "active",
+        "notes", "last_reminded_at", "created_at", "updated_at",
+    },
+    "stores": {"id", "household_id", "name", "normalized_name", "created_at"},
+    "item_events": {"id", "item_id", "chat_id", "action", "delta", "note", "created_at"},
+    "active_views": {"chat_id", "message_id", "view_type", "household_id", "store_id", "item_id", "page", "updated_at"},
+    "schema_migrations": {"name", "applied_at"},
+}
+
+
+def has_unique_key(connection: sqlite3.Connection, table: str, columns: set[str]) -> bool:
+    for (index,) in connection.execute(
+        'SELECT name FROM pragma_index_list(?) WHERE "unique" = 1 AND partial = 0', (table,)
+    ):
+        indexed = [row[0] for row in connection.execute("SELECT name FROM pragma_index_info(?)", (index,))]
+        if len(indexed) == len(columns) and set(indexed) == columns:
+            return True
+    return False
+
+
+def validate_database_schema(connection: sqlite3.Connection) -> None:
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    if not {"users", "households", "household_members", "inventory_items"} <= tables:
+        raise ConfigurationError("DATABASE_PATH is not an initialized inventory database.")
+    columns_by_table = {}
+    for table, required in _REQUIRED_COLUMNS.items():
+        if table not in tables:
+            continue
+        columns = {row[1]: row for row in connection.execute(f"PRAGMA table_info({table})")}
+        if not required <= columns.keys():
+            raise ConfigurationError("DATABASE_PATH has an unsupported inventory database schema.")
+        columns_by_table[table] = columns
+        identity_column = "chat_id" if table in {"users", "active_views"} else "id"
+        if identity_column in columns:
+            column = columns[identity_column]
+            if column[2].upper() != "INTEGER" or column[5] != 1:
+                raise ConfigurationError("DATABASE_PATH has an unsupported inventory database schema.")
+    if "store_id" in columns_by_table["inventory_items"] and "stores" not in tables:
+        raise ConfigurationError("DATABASE_PATH has an unsupported inventory database schema.")
+    unique_keys = {"household_members": {"household_id", "chat_id"}, "households": {"invite_code"}}
+    if "stores" in tables:
+        unique_keys["stores"] = {"household_id", "normalized_name"}
+    if "schema_migrations" in tables:
+        unique_keys["schema_migrations"] = {"name"}
+    inventory_scope = "store_id" if "store_id" in columns_by_table["inventory_items"] else "household_id"
+    unique_keys["inventory_items"] = {inventory_scope, "normalized_name"}
+    if any(not has_unique_key(connection, table, columns) for table, columns in unique_keys.items()):
+        raise ConfigurationError("DATABASE_PATH has an unsupported inventory database schema.")
+    if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+        raise ConfigurationError("DATABASE_PATH is not a valid inventory database.")
+
+
+def inspect_database(path: Path, user_id: int, *, allow_empty_users: bool = False) -> bool:
+    """Check recognized schema and identity read-only; return whether user exists."""
+    try:
+        if not path.is_file():
+            raise ConfigurationError("DATABASE_PATH must point to an existing inventory SQLite database file.")
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as connection:
+            validate_database_schema(connection)
+            known = connection.execute("SELECT 1 FROM users WHERE chat_id = ?", (user_id,)).fetchone() is not None
+            if not known and (not allow_empty_users or connection.execute("SELECT 1 FROM users LIMIT 1").fetchone()):
+                raise ConfigurationError("MCP_USER_ID must identify a user already registered in this inventory database.")
+            return known
+    except (sqlite3.Error, OSError):
+        raise ConfigurationError("Cannot read the existing inventory database in DATABASE_PATH.") from None
+
+
+def initialize_database(path: str | Path, user_id: int, household_name: str) -> Storage:
+    """Explicit operator setup, preserving all existing users and inventory."""
+    validate_user_id(user_id)
+    if not isinstance(household_name, str) or not (name := " ".join(household_name.split())) or "\0" in name:
+        raise ConfigurationError("The initial household name must be nonempty text.")
+    path = database_path(path)
+    known = False
+    created = False
+    sidecars = [path.with_name(path.name + suffix) for suffix in ("-journal", "-wal", "-shm")]
+    cleanup_sidecars: list[Path] = []
+    try:
+        if path.exists():
+            known = inspect_database(path, user_id, allow_empty_users=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            cleanup_sidecars = [sidecar for sidecar in sidecars if not sidecar.exists()]
+            # Set permissions at exclusive creation, never chmod an existing file.
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            created = True
+            os.close(descriptor)
+        storage = Storage(path)
+        if not known:
+            storage.record_user(user_id, None, None)
+        if not storage.list_households(user_id):
+            storage.create_household(user_id, name)
+        return storage
+    except (sqlite3.Error, OSError):
+        if created:
+            for created_path in [*cleanup_sidecars, path]:
+                try:
+                    created_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        raise ConfigurationError("Cannot initialize the inventory database.") from None
 
 
 class HouseholdResult(BaseModel):
@@ -180,7 +304,7 @@ def domain_errors(function: Callable[P, R]) -> Callable[P, R]:
         except ValueError as exc:
             raise ToolError(str(exc)) from None
         except (sqlite3.Error, KeyError):
-            raise ToolError("Inventory operation failed. Retry after checking the bot database.") from None
+            raise ToolError("Inventory operation failed. Retry after checking the inventory database.") from None
 
     return wrapped
 
@@ -205,15 +329,15 @@ Delta = Annotated[float, Field(allow_inf_nan=False, strict=True)]
 Name = Annotated[str, Field(min_length=1)]
 
 
-def build_server(storage: Storage, chat_id: int) -> MCPServer:
+def build_server(storage: Storage, user_id: int) -> MCPServer:
     """Build a server bound to one registered user; useful for embedding/tests."""
-    service = InventoryService(storage, chat_id)
+    service = InventoryService(storage, user_id)
     server = InventoryMCPServer(
         "home-warehouse",
         instructions=(
             "Manage the configured user's home inventory. First list households, then stores and items. "
             "IDs are scoped by household membership. Omitted units use the existing item's unit, or шт "
-            "for a new item. Read data is current SQLite state. Mutations do not send Telegram messages. "
+            "for a new item. Read data is current SQLite state. "
             "Archived items must be restored before editing; adding their exact name instead starts new stock."
         ),
         log_level="WARNING",
@@ -222,13 +346,13 @@ def build_server(storage: Storage, chat_id: int) -> MCPServer:
     @server.tool(annotations=READ)
     @domain_errors
     def list_households() -> HouseholdsResult:
-        """List homes accessible to the configured bot user, without invitation codes or member data."""
+        """List homes accessible to the configured local user, without invitation codes or member data."""
         return HouseholdsResult(households=[household_result(h) for h in service.list_households()])
 
     @server.tool(annotations=CREATE)
     @domain_errors
     def create_household(name: Name) -> HouseholdResult:
-        """Create a home and its initial stores; the bot selects the new home for this user."""
+        """Create a home and its initial stores; selects the new home for this user."""
         return household_result(service.create_household(name))
 
     @server.tool(annotations=READ)
@@ -240,7 +364,7 @@ def build_server(storage: Storage, chat_id: int) -> MCPServer:
     @server.tool(annotations=CREATE_STORE)
     @domain_errors
     def create_store(household_id: ObjectId, name: Name) -> StoreResult:
-        """Create a named store, or return the existing store with that name; selects it in the bot."""
+        """Create a named store, or return the existing store with that name; selects it for this user."""
         return store_result(service.create_store(household_id, name))
 
     @server.tool(annotations=READ)
@@ -262,7 +386,7 @@ def build_server(storage: Storage, chat_id: int) -> MCPServer:
     ) -> ItemResult:
         """Add stock with unit conversion; quantity/minimum must be finite and nonnegative.
 
-        Matches the bot's exact normalized name, then active partial-name lookup.
+        Matches an exact normalized name, then active partial-name lookup.
         An existing active item's unit stays unchanged. Omitted unit uses that
         unit (шт for new items). An archived exact-name item starts again with
         the supplied stock and becomes active; restore_item preserves old stock.
@@ -319,12 +443,25 @@ def build_server(storage: Storage, chat_id: int) -> MCPServer:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run the home warehouse MCP server over local stdin/stdout.",
-        epilog="Required environment: DATABASE_PATH (existing bot SQLite file), MCP_CHAT_ID (registered bot user ID).",
+        epilog=(
+            "Serving environment: DATABASE_PATH (initialized inventory SQLite file), MCP_USER_ID (registered local user ID). "
+            "MCP_CHAT_ID is a legacy alias for MCP_USER_ID. Bare invocation serves over stdio."
+        ),
     )
-    parser.parse_args(argv)
+    commands = parser.add_subparsers(dest="command")
+    commands.add_parser("serve", help="Serve an initialized database over local stdin/stdout.")
+    initialize = commands.add_parser("init", help="Initialize local inventory as an operator; safe to repeat.")
+    initialize.add_argument("--database-path", required=True, help="New or recognized existing inventory SQLite file.")
+    initialize.add_argument("--user-id", required=True, help="Nonzero signed 64-bit local identity.")
+    initialize.add_argument("--household-name", required=True, help="Initial home name, used only when this user has no homes.")
+    arguments = parser.parse_args(argv)
     try:
+        if arguments.command == "init":
+            initialize_database(arguments.database_path, parse_user_id(arguments.user_id), arguments.household_name)
+            print("Inventory database initialized.")
+            return 0
         settings = MCPSettings.from_env()
-        server = build_server(settings.open_storage(), settings.chat_id)
+        server = build_server(settings.open_storage(), settings.user_id)
     except (ConfigurationError, ValueError) as exc:
         print(f"MCP configuration error: {exc}", file=sys.stderr)
         return 2

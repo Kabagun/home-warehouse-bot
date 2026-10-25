@@ -52,11 +52,11 @@ async def call(client, tool_name, **arguments):
 
 def test_configuration_requires_explicit_database_and_existing_identity(tmp_path):
     with pytest.raises(ConfigurationError, match="DATABASE_PATH"):
-        MCPSettings.from_env({"MCP_CHAT_ID": "101"})
-    for identity in ("", "not-an-id", "1.5", "0", str(2**63)):
-        with pytest.raises(ConfigurationError, match="MCP_CHAT_ID"):
-            MCPSettings.from_env({"DATABASE_PATH": str(tmp_path / "missing.sqlite3"), "MCP_CHAT_ID": identity})
-    settings = MCPSettings.from_env({"DATABASE_PATH": str(tmp_path / "missing.sqlite3"), "MCP_CHAT_ID": "101"})
+        MCPSettings.from_env({"MCP_USER_ID": "101"})
+    for identity in ("", "not-an-id", "1.5", "1_0", "0", str(2**63), str(-(2**63) - 1)):
+        with pytest.raises(ConfigurationError, match="MCP_USER_ID"):
+            MCPSettings.from_env({"DATABASE_PATH": str(tmp_path / "missing.sqlite3"), "MCP_USER_ID": identity})
+    settings = MCPSettings.from_env({"DATABASE_PATH": str(tmp_path / "missing.sqlite3"), "MCP_USER_ID": "101"})
     with pytest.raises(ConfigurationError, match="existing"):
         settings.open_storage()
     assert not settings.database_path.exists()
@@ -99,6 +99,7 @@ async def test_tools_have_structured_schemas_annotations_and_no_identity_argumen
     for tool in tools:
         assert tool.output_schema
         assert "chat_id" not in tool.input_schema.get("properties", {})
+        assert "user_id" not in tool.input_schema.get("properties", {})
         assert "database_path" not in tool.input_schema.get("properties", {})
         assert tool.input_schema["additionalProperties"] is False
         assert tool.annotations.open_world_hint is False
@@ -219,6 +220,8 @@ async def test_identity_cannot_be_overridden_and_revoked_membership_is_checked(c
     storage, home, store, _, other_store, _ = inventory
     result = await client.call_tool("list_items", {"store_id": other_store.id, "chat_id": 202})
     assert result.is_error
+    result = await client.call_tool("list_items", {"store_id": other_store.id, "user_id": 202})
+    assert result.is_error
     item = await call(client, "add_item", store_id=store.id, name="Rice", quantity=2)
     with sqlite3.connect(storage.path) as connection:
         connection.execute("DELETE FROM household_members WHERE household_id=? AND chat_id=?", (home.id, 101))
@@ -275,13 +278,13 @@ def test_service_rejects_conversion_and_addition_overflow(inventory):
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("mode", ["auto", "legacy"])
-async def test_stdio_initialization_discovery_and_call_without_telegram_token(inventory, mode):
+async def test_stdio_initialization_discovery_and_call(inventory, mode):
     storage, home, store, *_ = inventory
     parameters = StdioServerParameters(
         command=sys.executable,
         args=[str(Path(__file__).with_name("mcp_server.py"))],
         cwd=Path(__file__).parent,
-        env={"DATABASE_PATH": str(storage.path), "MCP_CHAT_ID": "101", "PYTHONUTF8": "1"},
+        env={"DATABASE_PATH": str(storage.path), "MCP_USER_ID": "101", "PYTHONUTF8": "1"},
     )
     async with Client(parameters, mode=mode) as connected:
         names = {tool.name for tool in (await connected.list_tools()).tools}
@@ -299,12 +302,12 @@ async def test_stdio_initialization_discovery_and_call_without_telegram_token(in
     assert storage.get_item(added["id"]).quantity == 3
 
 
-def test_cli_help_and_configuration_errors_and_no_telegram_import(tmp_path):
+def test_cli_help_and_configuration_errors_and_transport_independent_import(tmp_path):
     script = Path(__file__).with_name("mcp_server.py")
-    environment = {key: value for key, value in os.environ.items() if key not in {"MCP_CHAT_ID", "DATABASE_PATH", "TELEGRAM_BOT_TOKEN"}}
+    environment = {key: value for key, value in os.environ.items() if key not in {"MCP_USER_ID", "MCP_CHAT_ID", "DATABASE_PATH", "TELEGRAM_BOT_TOKEN"}}
     help_result = subprocess.run([sys.executable, str(script), "--help"], capture_output=True, text=True, env=environment, timeout=20)
     assert help_result.returncode == 0
-    assert "MCP_CHAT_ID" in help_result.stdout and "DATABASE_PATH" in help_result.stdout
+    assert all(name in help_result.stdout for name in ("MCP_USER_ID", "MCP_CHAT_ID", "DATABASE_PATH", "init", "serve"))
     failure = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=environment, timeout=20)
     assert failure.returncode == 2
     assert failure.stdout == ""

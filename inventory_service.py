@@ -22,7 +22,7 @@ class InventoryService:
 
     def require_user(self) -> None:
         if self.storage.get_user(self.chat_id) is None:
-            raise ValueError("Пользователь не зарегистрирован в боте.")
+            raise ValueError("Пользователь не зарегистрирован.")
 
     def require_household(self, household_id: int) -> None:
         self.require_user()
@@ -87,7 +87,7 @@ class InventoryService:
     ) -> InventoryItem:
         """Add stock, preserving an active matching item's unit.
 
-        Name lookup follows the bot: exact normalized name, then an active
+        Name lookup uses the exact normalized name, then an active
         partial match. Re-adding an archived exact name starts its stock anew,
         as Storage.add_or_update_item does; restore_item preserves old stock.
         """

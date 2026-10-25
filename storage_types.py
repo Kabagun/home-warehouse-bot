@@ -1,4 +1,4 @@
-"""Inventory values shared by rendering and storage entry points."""
+"""Inventory values and compatibility models for persisted SQLite data."""
 
 from __future__ import annotations
 

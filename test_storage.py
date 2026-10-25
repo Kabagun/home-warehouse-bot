@@ -6,7 +6,6 @@ import sqlite3
 
 import pytest
 
-from bot import convert_quantity, hidden_item_name, parse_amount_text
 from storage import Storage, Store, format_quantity
 
 
@@ -130,30 +129,6 @@ def test_rename_item_rejects_duplicate_name(tmp_path: Path) -> None:
 def test_format_quantity() -> None:
     assert format_quantity(1.0) == "1"
     assert format_quantity(1.5) == "1.5"
-
-
-def test_parse_attached_units() -> None:
-    parsed = parse_amount_text("корм 9кг мин 500г")
-
-    assert parsed.name == "корм"
-    assert parsed.quantity == 9
-    assert parsed.unit == "кг"
-    assert parsed.min_quantity == 500
-    assert parsed.min_unit == "г"
-
-
-def test_convert_compatible_units() -> None:
-    assert convert_quantity(2500, "г", "кг") == 2.5
-    assert convert_quantity(2.5, "кг", "г") == 2500
-    assert convert_quantity(500, "мл", "л") == 0.5
-    assert convert_quantity(1, "шт", "кг") is None
-
-
-def test_hide_command_accepts_smart_dashes() -> None:
-    assert hidden_item_name("-- горох") == "горох"
-    assert hidden_item_name("— горох") == "горох"
-    assert hidden_item_name("– горох") == "горох"
-    assert hidden_item_name("- горох 1") is None
 
 
 def test_archive_restore_and_unit_change(tmp_path: Path) -> None:

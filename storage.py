@@ -38,6 +38,9 @@ class Storage:
     def _init_db(self) -> None:
         with closing(self._connect()) as connection:
             with connection:
+                # sqlite3's implicit transactions start at DML, not CREATE or
+                # ALTER. Include every schema change in the same rollback unit.
+                connection.execute("BEGIN IMMEDIATE")
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS users (
@@ -887,7 +890,7 @@ class Storage:
             household_id = int(row["household_id"])
             store_id = store_by_household.get(household_id)
             if store_id is None:
-                continue
+                raise sqlite3.IntegrityError("Cannot migrate an item without its household")
             connection.execute(
                 """
                 INSERT INTO inventory_items (
@@ -912,6 +915,9 @@ class Storage:
                     row["updated_at"],
                 ),
             )
+        # RENAME retargets item_events' foreign key to inventory_items_old.
+        # Rebind its rows to the new inventory before DROP can cascade them.
+        self._migrate_item_events_fk(connection)
         connection.execute("DROP TABLE inventory_items_old")
 
     def _migrate_item_events_fk(self, connection: sqlite3.Connection) -> None:

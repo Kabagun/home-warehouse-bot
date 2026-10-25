@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+: "${APP_DATA_DIR:?APP_DATA_DIR must point to a private persistent data directory}"
+: "${MCP_RELEASE_ID:?MCP_RELEASE_ID must be set by the deployment platform}"
+
+if [[ -z "${DATABASE_PATH:-}" ]]; then
+  export DATABASE_PATH="${APP_DATA_DIR%/}/home_warehouse_bot.sqlite3"
+fi
+
+exec "${MCP_PYTHON:-.venv/bin/python}" -u app_runtime.py

@@ -3,12 +3,11 @@ from __future__ import annotations
 import html
 import logging
 import os
-import re
+import sqlite3
 from dataclasses import dataclass
-from math import ceil
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
@@ -21,19 +20,26 @@ from telegram.ext import (
     filters,
 )
 
+from amounts import (
+    COMMON_UNIT_ALIASES, UNIT_ALIASES, ParsedAmount, UnitInfo, convert_quantity,
+    has_explicit_amount_unit, hidden_item_name, looks_like_number, minimum_in_item_unit,
+    normalize_unit, parse_amount_list, parse_amount_text, parse_float, parse_quantity_with_optional_unit,
+)
+from inventory_service import InventoryService
+import panels as ui
+from panels import (
+    BTN_STOCK, BTN_BUY, BTN_HOMES, BTN_HELP, MENU_BUTTONS, PAGE_SIZE,
+    archived_item_panel, cancel_keyboard, display_user, help_text, home_text,
+    item_create_keyboard, item_create_prompt, item_panel, item_settings_panel,
+    main_menu, no_home_panel, page_slice, pagination_rows, remaining_word, sorted_items,
+    store_edit_panel,
+)
 from storage import ActiveView, Household, InventoryItem, Storage, Store, User, format_quantity, normalize_name
 
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
-BTN_STOCK = "Склады"
-BTN_BUY = "Купить"
-BTN_HOMES = "Дом"
-BTN_HELP = "Помощь"
-MENU_BUTTONS = {BTN_STOCK, BTN_BUY, BTN_HOMES, BTN_HELP}
-PAGE_SIZE = 10
 
 
 @dataclass(frozen=True)
@@ -42,284 +48,12 @@ class Settings:
     database_path: str
 
 
-@dataclass(frozen=True)
-class UnitInfo:
-    group: str
-    base_factor: float
-    canonical: str
-
-
-@dataclass(frozen=True)
-class ParsedAmount:
-    name: str
-    quantity: float
-    unit: str
-    min_quantity: float | None
-    min_unit: str | None
-
-
-UNIT_ALIASES = {
-    "г": UnitInfo("mass", 1.0, "г"),
-    "гр": UnitInfo("mass", 1.0, "г"),
-    "грамм": UnitInfo("mass", 1.0, "г"),
-    "грамма": UnitInfo("mass", 1.0, "г"),
-    "граммов": UnitInfo("mass", 1.0, "г"),
-    "g": UnitInfo("mass", 1.0, "г"),
-    "кг": UnitInfo("mass", 1000.0, "кг"),
-    "килограмм": UnitInfo("mass", 1000.0, "кг"),
-    "килограмма": UnitInfo("mass", 1000.0, "кг"),
-    "килограммов": UnitInfo("mass", 1000.0, "кг"),
-    "kg": UnitInfo("mass", 1000.0, "кг"),
-    "мл": UnitInfo("volume", 1.0, "мл"),
-    "миллилитр": UnitInfo("volume", 1.0, "мл"),
-    "миллилитра": UnitInfo("volume", 1.0, "мл"),
-    "миллилитров": UnitInfo("volume", 1.0, "мл"),
-    "ml": UnitInfo("volume", 1.0, "мл"),
-    "л": UnitInfo("volume", 1000.0, "л"),
-    "литр": UnitInfo("volume", 1000.0, "л"),
-    "литра": UnitInfo("volume", 1000.0, "л"),
-    "литров": UnitInfo("volume", 1000.0, "л"),
-    "l": UnitInfo("volume", 1000.0, "л"),
-}
-
-COMMON_UNIT_ALIASES = {
-    "т": "табл",
-    "таб": "табл",
-    "табл": "табл",
-    "таблетка": "табл",
-    "таблетки": "табл",
-    "таблеток": "табл",
-    "капс": "капс",
-    "капсула": "капс",
-    "капсулы": "капс",
-    "капсул": "капс",
-    "шт": "шт",
-    "штука": "шт",
-    "штуки": "шт",
-    "штук": "шт",
-    "пачка": "пачка",
-    "пачки": "пачка",
-    "пачек": "пачка",
-}
-
-
 def load_settings() -> Settings:
     load_dotenv()
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise RuntimeError("Укажите TELEGRAM_BOT_TOKEN в .env или переменных окружения.")
     return Settings(token=token, database_path=os.getenv("DATABASE_PATH", "home_warehouse_bot.sqlite3"))
-
-
-def main_menu() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton(BTN_STOCK), KeyboardButton(BTN_BUY)],
-            [KeyboardButton(BTN_HOMES), KeyboardButton(BTN_HELP)],
-        ],
-        resize_keyboard=True,
-        input_field_placeholder="+ кофе 1 или - кофе 1",
-    )
-
-
-def normalize_unit(value: str) -> str:
-    normalized = value.strip().lower().rstrip(".")
-    if normalized in COMMON_UNIT_ALIASES:
-        return COMMON_UNIT_ALIASES[normalized]
-    return UNIT_ALIASES.get(normalized, UnitInfo("", 1.0, normalized)).canonical
-
-
-def convert_quantity(quantity: float, from_unit: str, to_unit: str) -> float | None:
-    source = normalize_unit(from_unit)
-    target = normalize_unit(to_unit)
-    if source == target:
-        return quantity
-    from_info = UNIT_ALIASES.get(source)
-    to_info = UNIT_ALIASES.get(target)
-    if from_info is None or to_info is None or from_info.group != to_info.group:
-        return None
-    return quantity * from_info.base_factor / to_info.base_factor
-
-
-def parse_float(value: str) -> float:
-    result = float(value.replace(",", "."))
-    if result < 0:
-        raise ValueError("Количество не может быть отрицательным.")
-    return result
-
-
-def looks_like_number(value: str) -> bool:
-    try:
-        parse_float(value)
-        return True
-    except ValueError:
-        return False
-
-
-def parse_amount_text(text: str) -> ParsedAmount:
-    cleaned = " ".join(text.strip().split())
-    if not cleaned:
-        raise ValueError("Введите название и количество.")
-    min_quantity: float | None = None
-    min_unit: str | None = None
-    min_match = re.search(
-        r"\s+(?:мин|минимум|min)\s+(\d+(?:[.,]\d+)?)\s*([^\d\s]+)?\s*$",
-        cleaned,
-        re.IGNORECASE,
-    )
-    if min_match:
-        min_quantity = parse_float(min_match.group(1))
-        min_unit = normalize_unit(min_match.group(2)) if min_match.group(2) else None
-        cleaned = cleaned[: min_match.start()].strip()
-
-    tokens = cleaned.split()
-    amount_index: int | None = None
-    attached_unit: str | None = None
-    for index, token in enumerate(tokens):
-        if looks_like_number(token):
-            amount_index = index
-            break
-        match = re.fullmatch(r"(\d+(?:[.,]\d+)?)([^\d\s]+)", token, re.IGNORECASE)
-        if match:
-            amount_index = index
-            attached_unit = match.group(2)
-            tokens[index] = match.group(1)
-            break
-    if amount_index is None:
-        return ParsedAmount(cleaned, 1.0, "шт", min_quantity, min_unit)
-    name = " ".join(tokens[:amount_index]).strip()
-    if not name:
-        raise ValueError("Сначала напишите название, потом количество.")
-    quantity = parse_float(tokens[amount_index])
-    unit_parts = ([attached_unit] if attached_unit else []) + tokens[amount_index + 1 :]
-    unit = normalize_unit(" ".join(unit_parts).strip() or "шт")
-    return ParsedAmount(name, quantity, unit, min_quantity, min_unit)
-
-
-def parse_amount_list(text: str) -> tuple[list[tuple[int, ParsedAmount]], list[tuple[int, str]]]:
-    parsed_lines: list[tuple[int, ParsedAmount]] = []
-    errors: list[tuple[int, str]] = []
-    for line_number, raw_line in enumerate(text.splitlines(), start=1):
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith("+"):
-            line = line[1:].strip()
-        try:
-            parsed_lines.append((line_number, parse_amount_text(line)))
-        except ValueError as exc:
-            errors.append((line_number, str(exc)))
-    if not parsed_lines and not errors:
-        errors.append((1, "Введите название и количество."))
-    return parsed_lines, errors
-
-
-def parse_quantity_with_optional_unit(text: str, default_unit: str) -> tuple[float, str]:
-    cleaned = " ".join(text.strip().split())
-    match = re.fullmatch(r"(\d+(?:[.,]\d+)?)\s*([^\d\s]+)?", cleaned, re.IGNORECASE)
-    if not match:
-        raise ValueError("Введите число, например: 1 или 500г.")
-    quantity = parse_float(match.group(1))
-    unit = normalize_unit(match.group(2)) if match.group(2) else default_unit
-    return quantity, unit
-
-
-def has_explicit_amount_unit(text: str) -> bool:
-    cleaned = re.sub(
-        r"\s+(?:мин|минимум|min)\s+\d+(?:[.,]\d+)?\s*[^\d\s]*\s*$",
-        "",
-        " ".join(text.strip().split()),
-        flags=re.IGNORECASE,
-    )
-    tokens = cleaned.split()
-    for index, token in enumerate(tokens):
-        if looks_like_number(token):
-            return index + 1 < len(tokens)
-        if re.fullmatch(r"\d+(?:[.,]\d+)?[^\d\s]+", token, re.IGNORECASE):
-            return True
-    return False
-
-
-def hidden_item_name(text: str) -> str | None:
-    stripped = text.lstrip()
-    if stripped.startswith("--"):
-        return stripped[2:].strip()
-    if stripped.startswith(("—", "–")):
-        return stripped[1:].strip()
-    return None
-
-
-def minimum_in_item_unit(parsed: ParsedAmount, item_unit: str) -> float | None:
-    if parsed.min_quantity is None:
-        return None
-    source_unit = parsed.min_unit or parsed.unit
-    converted = convert_quantity(parsed.min_quantity, source_unit, item_unit)
-    return converted if converted is not None else parsed.min_quantity
-
-
-def remaining_word(quantity: float, unit: str) -> str:
-    if quantity == 1:
-        if unit in {"шт", "табл", "капс", "пачка"}:
-            return "осталась"
-        if unit in {"кг", "г", "л", "мл"}:
-            return "остался"
-    return "осталось"
-
-
-def display_user(user: User) -> str:
-    return user.first_name or (f"@{user.username}" if user.username else str(user.chat_id))
-
-
-def sorted_items(items: list[InventoryItem]) -> list[InventoryItem]:
-    return sorted(items, key=lambda item: (not item.is_low, item.normalized_name))
-
-
-def page_slice(items: list[object], page: int) -> tuple[list[object], int, int]:
-    pages = max(1, ceil(len(items) / PAGE_SIZE))
-    safe_page = min(max(0, page), pages - 1)
-    start = safe_page * PAGE_SIZE
-    return items[start : start + PAGE_SIZE], safe_page, pages
-
-
-def pagination_rows(prefix: str, page: int, pages: int) -> list[list[InlineKeyboardButton]]:
-    if pages <= 1:
-        return []
-    row: list[InlineKeyboardButton] = []
-    if page > 0:
-        row.append(InlineKeyboardButton("Предыдущая", callback_data=f"{prefix}:{page - 1}"))
-    if page + 1 < pages:
-        row.append(InlineKeyboardButton("Следующая", callback_data=f"{prefix}:{page + 1}"))
-    return [row]
-
-
-def home_text(household: Household, members: list[User]) -> str:
-    names = ", ".join(display_user(member) for member in members) or "пока только вы"
-    return (
-        f"Текущий дом: {html.escape(household.name)}\n"
-        f"Участники: {html.escape(names)}\n"
-        f"Код приглашения: <code>{household.invite_code}</code>"
-    )
-
-
-def help_text() -> str:
-    return (
-        "<b>Бот домашнего инвентаря</b>\n\n"
-        "У каждого человека может быть несколько домов: общий дом, родители или дача. "
-        "Дом можно открыть другому человеку через код приглашения. Внутри дома можно создать несколько складов.\n\n"
-        "<b>Работа со складом</b>\n"
-        "Откройте склад, выберите товар и используйте кнопки «Списать» или «Добавить». "
-        "Для существующей позиции достаточно написать количество: <code>2</code>, <code>2табл</code> или <code>500г</code>.\n\n"
-        "Кнопка «Новая позиция» принимает один товар или список — каждый товар с новой строки. "
-        "После добавления форма остаётся открытой для следующих позиций.\n\n"
-        "<b>Быстрый ввод</b>\n"
-        "<code>+ Бумага 8</code> — добавить 8 штук\n"
-        "<code>- Бумага 3</code> — списать 3 штуки\n"
-        "<code>+ корм 9кг</code> — добавить вес\n"
-        "<code>- корм 2,5кг</code> — списать вес\n"
-        "<code>&#45;&#45; горох</code> — перенести позицию в архив\n"
-        "<code>+ корм 9кг мин 500г</code> — добавить корм с минимумом 500г\n\n"
-        "По умолчанию минимум равен 1. Если остаток меньше или равен минимуму, позиция появляется в разделе «Купить»."
-    )
 
 
 def storage_from(context: ContextTypes.DEFAULT_TYPE) -> Storage:
@@ -435,276 +169,48 @@ async def edit_registered_panel(
     return False
 
 
-def no_home_panel() -> tuple[str, InlineKeyboardMarkup]:
-    return (
-        "Дом пока не выбран.\n\nСоздайте новый дом или присоединитесь по коду.",
-        InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("Создать дом", callback_data="v2:home_create")],
-                [InlineKeyboardButton("Присоединиться по коду", callback_data="v2:home_join")],
-            ]
-        ),
-    )
-
-
 def homes_panel(storage: Storage, user: User) -> tuple[str, InlineKeyboardMarkup, Household | None]:
     current = storage.current_household(user.chat_id)
-    if current is None:
-        text, keyboard = no_home_panel()
-        return text, keyboard, None
-    rows: list[list[InlineKeyboardButton]] = []
-    for household in storage.list_households(user.chat_id):
-        marker = "• " if household.id == current.id else ""
-        rows.append(
-            [InlineKeyboardButton(f"{marker}{household.name}", callback_data=f"v2:home:{household.id}")]
-        )
-    rows.extend(
-        [
-            [InlineKeyboardButton("Редактировать", callback_data="v2:home_edit")],
-            [InlineKeyboardButton("Присоединиться по коду", callback_data="v2:home_join")],
-        ]
-    )
-    return home_text(current, storage.list_members(current.id)), InlineKeyboardMarkup(rows), current
+    return ui.homes_panel(current, storage.list_households(user.chat_id), storage.list_members(current.id) if current else [])
 
 
 def home_edit_panel(storage: Storage, user: User) -> tuple[str, InlineKeyboardMarkup, Household] | None:
     current = storage.current_household(user.chat_id)
-    if current is None:
-        return None
-    role = storage.household_role(current.id, user.chat_id)
-    remove_label = "Удалить дом" if role == "owner" else "Выйти из дома"
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Создать дом", callback_data="v2:home_create")],
-            [InlineKeyboardButton("Переименовать дом", callback_data="v2:home_rename")],
-            [InlineKeyboardButton(remove_label, callback_data=f"v2:home_remove:{current.id}")],
-            [InlineKeyboardButton("Назад", callback_data="v2:home_back")],
-        ]
-    )
-    return f"<b>{html.escape(current.name)}</b>\n\nРедактирование дома:", keyboard, current
+    return ui.home_edit_panel(current, storage.household_role(current.id, user.chat_id) if current else None)
 
 
 def stores_panel(storage: Storage, user: User) -> tuple[str, InlineKeyboardMarkup, Household] | None:
     household = storage.current_household(user.chat_id)
     if household is None:
         return None
-    refreshed_user = storage.get_user(user.chat_id)
-    quick_store = storage.get_store(refreshed_user.current_store_id) if refreshed_user else None
-    quick_name = html.escape(quick_store.name) if quick_store and quick_store.household_id == household.id else "не выбран"
-    rows: list[list[InlineKeyboardButton]] = []
-    for store in storage.list_stores(household.id):
-        low_count = len(storage.low_items(store.id))
-        suffix = f" · купить {low_count}" if low_count else ""
-        rows.append([InlineKeyboardButton(f"{store.name}{suffix}", callback_data=f"v2:store:{store.id}:0")])
-    rows.append([InlineKeyboardButton("Редактировать", callback_data="v2:store_edit")])
-    text = (
-        f"Дом: {html.escape(household.name)}\n"
-        f"Быстрый ввод: {quick_name}\n\n"
-        "Выберите склад:"
-    )
-    return text, InlineKeyboardMarkup(rows), household
-
-
-def store_edit_panel(household: Household) -> tuple[str, InlineKeyboardMarkup]:
-    return (
-        f"<b>{html.escape(household.name)}</b>\n\nРедактирование складов:",
-        InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("Создать", callback_data="v2:store_create")],
-                [InlineKeyboardButton("Переименовать", callback_data="v2:store_rename")],
-                [InlineKeyboardButton("Удалить", callback_data="v2:store_delete")],
-                [InlineKeyboardButton("Назад", callback_data="v2:stores_back")],
-            ]
-        ),
-    )
+    refreshed = storage.get_user(user.chat_id)
+    quick_store = storage.get_store(refreshed.current_store_id) if refreshed and refreshed.current_store_id else None
+    stores = storage.list_stores(household.id)
+    return ui.stores_panel(household, stores, quick_store, {store.id: len(storage.low_items(store.id)) for store in stores})
 
 
 def store_pick_panel(storage: Storage, household: Household, action: str) -> tuple[str, InlineKeyboardMarkup]:
-    action_text = "переименовать" if action == "rename" else "удалить"
-    rows = [
-        [InlineKeyboardButton(store.name, callback_data=f"v2:store_{action}_pick:{store.id}")]
-        for store in storage.list_stores(household.id)
-    ]
-    rows.append([InlineKeyboardButton("Назад", callback_data="v2:store_edit")])
-    return (
-        f"<b>{html.escape(household.name)}</b>\n\nВыберите склад, который нужно {action_text}:",
-        InlineKeyboardMarkup(rows),
-    )
+    return ui.store_pick_panel(household, storage.list_stores(household.id), action)
 
 
-def store_panel(storage: Storage, store: Store, page: int) -> tuple[str, InlineKeyboardMarkup, int]:
-    items = sorted_items(storage.list_items(store.id))
-    visible, safe_page, pages = page_slice(items, page)
-    low_count = sum(1 for item in items if item.is_low)
-    rows: list[list[InlineKeyboardButton]] = []
-    for item in visible:
-        marker = "−" if item.is_low else "•"
-        label = f"{marker} {item.name} · {format_quantity(item.quantity)} {item.unit}"
-        rows.append([InlineKeyboardButton(label, callback_data=f"v2:item:{item.id}:{safe_page}")])
-    rows.extend(pagination_rows(f"v2:store:{store.id}", safe_page, pages))
-    rows.extend(
-        [
-            [
-                InlineKeyboardButton("Новая позиция", callback_data=f"v2:item_create:{store.id}:{safe_page}"),
-                InlineKeyboardButton("Архив", callback_data=f"v2:archive:{store.id}:0"),
-            ],
-            [
-                InlineKeyboardButton("Обновить", callback_data=f"v2:store:{store.id}:{safe_page}"),
-                InlineKeyboardButton("Назад", callback_data="v2:stores_back"),
-            ],
-        ]
-    )
-    text = (
-        f"<b>{html.escape(store.name)}</b>\n"
-        f"Позиций: {len(items)} · купить: {low_count}"
-    )
-    if not items:
-        text += "\n\nСклад пока пуст."
-    return text, InlineKeyboardMarkup(rows), safe_page
+def store_panel(
+    storage: Storage, store: Store, page: int, household: Household | None = None
+) -> tuple[str, InlineKeyboardMarkup, int]:
+    return ui.store_panel(store, storage.list_items(store.id), page, household or storage.get_household(store.household_id))
 
 
-def item_panel(item: InventoryItem, page: int) -> tuple[str, InlineKeyboardMarkup]:
-    status = "нужно купить" if item.is_low else "в запасе"
-    text = (
-        f"<b>{html.escape(item.name)}</b>\n\n"
-        f"Остаток: {format_quantity(item.quantity)} {html.escape(item.unit)}\n"
-        f"Минимум: {format_quantity(item.min_quantity)} {html.escape(item.unit)}\n"
-        f"Статус: {status}"
-    )
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("−1", callback_data=f"v2:delta:{item.id}:minus:{page}"),
-                InlineKeyboardButton("+1", callback_data=f"v2:delta:{item.id}:plus:{page}"),
-            ],
-            [
-                InlineKeyboardButton("Списать", callback_data=f"v2:adjust:{item.id}:use:{page}"),
-                InlineKeyboardButton("Добавить", callback_data=f"v2:adjust:{item.id}:add:{page}"),
-            ],
-            [InlineKeyboardButton("Настройки", callback_data=f"v2:item_settings:{item.id}:{page}")],
-            [InlineKeyboardButton("Назад", callback_data=f"v2:store:{item.store_id}:{page}")],
-        ]
-    )
-    return text, keyboard
-
-
-def item_settings_panel(item: InventoryItem, page: int) -> tuple[str, InlineKeyboardMarkup]:
-    return (
-        f"<b>{html.escape(item.name)}</b>\n\nНастройки позиции:",
-        InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Переименовать", callback_data=f"v2:item_rename:{item.id}:{page}"),
-                    InlineKeyboardButton("Минимум", callback_data=f"v2:item_min:{item.id}:{page}"),
-                ],
-                [InlineKeyboardButton("Единица", callback_data=f"v2:item_unit:{item.id}:{page}")],
-                [InlineKeyboardButton("В архив", callback_data=f"v2:item_archive:{item.id}:{page}")],
-                [InlineKeyboardButton("Удалить", callback_data=f"v2:item_delete:{item.id}:{page}:item")],
-                [InlineKeyboardButton("Назад", callback_data=f"v2:item:{item.id}:{page}")],
-            ]
-        ),
-    )
-
-
-def archive_panel(storage: Storage, store: Store, page: int) -> tuple[str, InlineKeyboardMarkup, int]:
-    items = sorted(
-        [item for item in storage.list_items(store.id, include_inactive=True) if not item.active],
-        key=lambda item: item.normalized_name,
-    )
-    visible, safe_page, pages = page_slice(items, page)
-    rows = [
-        [
-            InlineKeyboardButton(
-                f"{item.name} · {format_quantity(item.quantity)} {item.unit}",
-                callback_data=f"v2:archived:{item.id}:{safe_page}",
-            )
-        ]
-        for item in visible
-    ]
-    rows.extend(pagination_rows(f"v2:archive:{store.id}", safe_page, pages))
-    rows.append([InlineKeyboardButton("Назад", callback_data=f"v2:store:{store.id}:0")])
-    text = f"<b>{html.escape(store.name)}</b>\n\nАрхив"
-    if not items:
-        text += " пока пуст."
-    return text, InlineKeyboardMarkup(rows), safe_page
-
-
-def archived_item_panel(item: InventoryItem, page: int) -> tuple[str, InlineKeyboardMarkup]:
-    text = (
-        f"<b>{html.escape(item.name)}</b>\n\n"
-        f"Остаток: {format_quantity(item.quantity)} {html.escape(item.unit)}\n"
-        f"Минимум: {format_quantity(item.min_quantity)} {html.escape(item.unit)}\n"
-        "Статус: в архиве"
-    )
-    return (
-        text,
-        InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("Восстановить", callback_data=f"v2:item_restore:{item.id}:{page}")],
-                [InlineKeyboardButton("Удалить", callback_data=f"v2:item_delete:{item.id}:{page}:archive")],
-                [InlineKeyboardButton("Назад", callback_data=f"v2:archive:{item.store_id}:{page}")],
-            ]
-        ),
+def archive_panel(
+    storage: Storage, store: Store, page: int, household: Household | None = None
+) -> tuple[str, InlineKeyboardMarkup, int]:
+    return ui.archive_panel(
+        store, storage.list_items(store.id, include_inactive=True), page,
+        household or storage.get_household(store.household_id),
     )
 
 
 def buy_panel(storage: Storage, household: Household, page: int) -> tuple[str, InlineKeyboardMarkup, int]:
-    entries: list[tuple[Store, InventoryItem]] = []
-    for store, items in storage.low_items_by_store(household.id):
-        entries.extend((store, item) for item in items)
-    visible, safe_page, pages = page_slice(entries, page)
-    rows: list[list[InlineKeyboardButton]] = []
-    for store, item in visible:
-        label = (
-            f"{store.name} · {item.name} · {remaining_word(item.quantity, item.unit)} "
-            f"{format_quantity(item.quantity)} {item.unit}"
-        )
-        rows.append([InlineKeyboardButton(label, callback_data=f"v2:buy_item:{item.id}:{safe_page}")])
-    rows.extend(pagination_rows("v2:buy", safe_page, pages))
-    rows.append([InlineKeyboardButton("Обновить", callback_data=f"v2:buy:{safe_page}")])
-    text = f"<b>Купить для «{html.escape(household.name)}»</b>"
-    if not entries:
-        text += "\n\nПокупать пока ничего не нужно."
-    return text, InlineKeyboardMarkup(rows), safe_page
-
-
-def cancel_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="v2:flow_cancel")]])
-
-
-def item_create_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="v2:flow_cancel")]])
-
-
-def item_create_prompt(
-    store: Store,
-    added_names: list[str] | None = None,
-    problems: list[tuple[int, str]] | None = None,
-) -> str:
-    parts = [f"<b>Новая позиция · {html.escape(store.name)}</b>"]
-    added_names = added_names or []
-    problems = problems or []
-    if added_names:
-        parts.append(f"Добавлено: {len(added_names)}")
-        parts.extend(f"• {html.escape(name)}" for name in added_names[:8])
-        if len(added_names) > 8:
-            parts.append(f"• и ещё {len(added_names) - 8}")
-    if problems:
-        problem_lines = ["Не добавлено:"]
-        problem_lines.extend(
-            f"• строка {line_number}: {html.escape(reason)}"
-            for line_number, reason in problems[:8]
-        )
-        if len(problems) > 8:
-            problem_lines.append(f"• и ещё {len(problems) - 8}")
-        parts.append("\n".join(problem_lines))
-    parts.append(
-        "Отправьте одну позицию или список — каждый товар с новой строки.\n\n"
-        "<code>Миг 8табл\n"
-        "корм 9кг мин 500г\n"
-        "бумага 4</code>"
-    )
-    return "\n\n".join(parts)
+    entries = [(store, item) for store, items in storage.low_items_by_store(household.id) for item in items]
+    return ui.buy_panel(household, entries, page)
 
 
 async def show_homes_panel(
@@ -765,7 +271,7 @@ async def show_store_panel(
     if store is None:
         await show_stores_panel(update, context, message_id=message_id)
         return
-    text, keyboard, safe_page = store_panel(storage, store, page)
+    text, keyboard, safe_page = store_panel(storage, store, page, storage.current_household(user.chat_id))
     await edit_or_send_panel(
         context,
         user.chat_id,
@@ -793,7 +299,7 @@ async def show_item_panel(
     if item is None or not item.active or storage.set_current_store(user.chat_id, item.store_id) is None:
         await show_stores_panel(update, context, message_id=message_id)
         return
-    text, keyboard = item_panel(item, page)
+    text, keyboard = item_panel(item, page, storage.get_store(item.store_id), storage.current_household(user.chat_id))
     await edit_or_send_panel(
         context,
         user.chat_id,
@@ -804,6 +310,32 @@ async def show_item_panel(
         store_id=item.store_id,
         item_id=item.id,
         page=page,
+        message_id=message_id,
+    )
+
+
+async def show_store_settings_panel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    store_id: int,
+    *,
+    message_id: int | None = None,
+) -> None:
+    storage, user = record_user(update, context)
+    clear_flow(context)
+    store = storage.set_current_store(user.chat_id, store_id)
+    if store is None:
+        await show_stores_panel(update, context, message_id=message_id)
+        return
+    text, keyboard = ui.store_settings_panel(store, storage.current_household(user.chat_id))
+    await edit_or_send_panel(
+        context,
+        user.chat_id,
+        text,
+        keyboard,
+        view_type="store_settings",
+        household_id=store.household_id,
+        store_id=store.id,
         message_id=message_id,
     )
 
@@ -837,6 +369,9 @@ async def show_buy_panel(
 async def refresh_household_views(context: ContextTypes.DEFAULT_TYPE, household_id: int) -> None:
     storage = storage_from(context)
     for view in storage.active_views_for_household(household_id):
+        if not storage.is_household_member(household_id, view.chat_id):
+            storage.clear_active_view(view.chat_id, view.message_id)
+            continue
         if view.view_type == "prompt" or view.view_type == "home":
             continue
         text: str | None = None
@@ -851,10 +386,13 @@ async def refresh_household_views(context: ContextTypes.DEFAULT_TYPE, household_
             panel = stores_panel(storage, user) if user else None
             if panel:
                 text, keyboard, _ = panel
-        elif view.view_type == "store":
+        elif view.view_type in {"store", "store_settings"}:
             store = storage.get_store(view.store_id or 0)
             if store:
-                text, keyboard, new_page = store_panel(storage, store, view.page)
+                if view.view_type == "store_settings":
+                    text, keyboard = ui.store_settings_panel(store, storage.get_household(store.household_id))
+                else:
+                    text, keyboard, new_page = store_panel(storage, store, view.page)
             else:
                 user = storage.get_user(view.chat_id)
                 panel = stores_panel(storage, user) if user else None
@@ -864,7 +402,9 @@ async def refresh_household_views(context: ContextTypes.DEFAULT_TYPE, household_
         elif view.view_type == "item":
             item = storage.get_item(view.item_id or 0)
             if item and item.active:
-                text, keyboard = item_panel(item, view.page)
+                text, keyboard = item_panel(
+                    item, view.page, storage.get_store(item.store_id), storage.get_household(item.household_id)
+                )
             else:
                 store = storage.get_store(view.store_id or 0)
                 if store:
@@ -920,9 +460,25 @@ async def show_prompt(
     item_id: int | None = None,
     keyboard: InlineKeyboardMarkup | None = None,
 ) -> int:
+    flow = current_flow(context)
     if keyboard is None:
-        flow = current_flow(context)
-        keyboard = item_create_keyboard() if flow and flow.get("mode") == "item_create" else cancel_keyboard()
+        destinations = {
+            "item": "к позиции", "store": "к складу", "stores": "к складам",
+            "buy": "к покупкам", "home": "к домам", "store_settings": "к настройкам склада",
+        }
+        destination = destinations.get(str(flow.get("return_view", "")), "") if flow else ""
+        keyboard = (
+            item_create_keyboard() if flow and flow.get("mode") == "item_create"
+            else cancel_keyboard(f"Отмена · {destination}" if destination else "Отмена")
+        )
+    storage = storage_from(context)
+    if household_id is not None and storage.is_household_member(household_id, update.effective_chat.id):
+        household = storage.get_household(household_id)
+        store = storage.get_store(store_id) if store_id is not None else None
+        if store and store.household_id == household_id:
+            text = f"{ui.store_context(store, household)}\n\n{text}"
+        elif household:
+            text = f"Дом: {html.escape(household.name)}\n\n{text}"
     resolved_message_id = await edit_or_send_panel(
         context,
         update.effective_chat.id,
@@ -963,6 +519,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     clear_flow(context)
     storage.clear_active_view(user.chat_id)
     await update.message.reply_text(help_text(), reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+
+
+async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat is None or update.message is None:
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Отправьте /id в личном чате с ботом.")
+        return
+    _, user = record_user(update, context)
+    await update.message.reply_text(f"Ваш ID: {user.chat_id}")
 
 
 async def new_home_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1058,6 +624,8 @@ async def restore_flow_parent(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_item_panel(update, context, int(flow["item_id"]), page, message_id=message_id)
     elif return_view == "store" and flow.get("store_id") is not None:
         await show_store_panel(update, context, int(flow["store_id"]), page, message_id=message_id)
+    elif return_view == "store_settings" and flow.get("store_id") is not None:
+        await show_store_settings_panel(update, context, int(flow["store_id"]), message_id=message_id)
     elif return_view == "buy":
         await show_buy_panel(update, context, page, message_id=message_id)
     elif return_view == "home":
@@ -1127,11 +695,11 @@ async def handle_flow_text(
 
     if mode == "store_create" and household_id is not None:
         try:
-            store = storage.create_store(user.chat_id, household_id, text)
-        except Exception:
-            store = None
-        if store is None:
-            await show_prompt(update, context, "Не получилось создать склад. Возможно, такое название уже есть.", message_id=message_id)
+            store = InventoryService(storage, user.chat_id).create_store(household_id, text)
+        except ValueError as exc:
+            await show_prompt(
+                update, context, html.escape(str(exc)), message_id=message_id, household_id=household_id
+            )
             return
         clear_flow(context)
         await show_store_panel(update, context, store.id, 0, message_id=message_id)
@@ -1140,13 +708,13 @@ async def handle_flow_text(
     if mode == "store_rename" and store_id is not None:
         try:
             store = storage.rename_store(user.chat_id, store_id, text)
-        except Exception:
+        except sqlite3.IntegrityError:
             store = None
         if store is None:
             await show_prompt(update, context, "Не получилось переименовать склад. Проверьте название.", message_id=message_id)
             return
         clear_flow(context)
-        await show_stores_panel(update, context, message_id=message_id)
+        await show_store_settings_panel(update, context, store.id, message_id=message_id)
         return
 
     if mode == "item_create" and store_id is not None:
@@ -1168,18 +736,12 @@ async def handle_flow_text(
                 location = "в архиве" if not existing.active else "на складе"
                 problems.append((line_number, f"«{existing.name}» уже есть {location}."))
                 continue
-            minimum = minimum_in_item_unit(parsed, parsed.unit)
             try:
-                item = storage.add_or_update_item(
-                    store.id,
-                    user.chat_id,
-                    parsed.name,
-                    parsed.quantity,
-                    parsed.unit,
-                    minimum,
+                item = InventoryService(storage, user.chat_id).create_item(
+                    store.id, parsed.name, parsed.quantity, parsed.unit, parsed.min_quantity, parsed.min_unit
                 )
-            except (KeyError, ValueError):
-                problems.append((line_number, "Не получилось добавить позицию."))
+            except ValueError as exc:
+                problems.append((line_number, str(exc)))
                 continue
             existing_items[item.normalized_name] = item
             added_names.append(item.name)
@@ -1209,20 +771,13 @@ async def handle_flow_text(
     if mode in {"item_adjust", "buy_adjust"}:
         try:
             quantity, unit = parse_quantity_with_optional_unit(text, item.unit)
+            action = str(flow.get("action", "add"))
+            delta = quantity if action == "add" else -quantity
+            InventoryService(storage, user.chat_id).change_quantity(item.id, delta, unit)
         except ValueError as exc:
             await show_prompt(update, context, f"<b>{html.escape(str(exc))}</b>\n\nСейчас: {format_quantity(item.quantity)} {html.escape(item.unit)}.", message_id=message_id, household_id=item.household_id, store_id=item.store_id, item_id=item.id)
             return
-        converted = convert_quantity(quantity, unit, item.unit)
-        if converted is None:
-            await show_prompt(update, context, f"Для этой позиции количество нужно указать в {html.escape(item.unit)}.", message_id=message_id, household_id=item.household_id, store_id=item.store_id, item_id=item.id)
-            return
-        action = str(flow.get("action", "add"))
-        delta = converted if action == "add" else -converted
-        updated = storage.change_item_quantity(item.store_id, user.chat_id, item.id, delta)
         clear_flow(context)
-        if updated is None:
-            await show_stores_panel(update, context, message_id=message_id)
-            return
         if mode == "buy_adjust":
             await show_buy_panel(update, context, page, message_id=message_id)
         else:
@@ -1243,14 +798,10 @@ async def handle_flow_text(
     if mode == "item_min":
         try:
             quantity, unit = parse_quantity_with_optional_unit(text, item.unit)
+            InventoryService(storage, user.chat_id).set_minimum(item.id, quantity, unit)
         except ValueError as exc:
             await show_prompt(update, context, html.escape(str(exc)), message_id=message_id, household_id=item.household_id, store_id=item.store_id, item_id=item.id)
             return
-        converted = convert_quantity(quantity, unit, item.unit)
-        if converted is None:
-            await show_prompt(update, context, f"Минимум нужно указать в {html.escape(item.unit)}.", message_id=message_id, household_id=item.household_id, store_id=item.store_id, item_id=item.id)
-            return
-        storage.set_item_minimum(item.store_id, item.id, converted, user.chat_id)
         clear_flow(context)
         await show_item_panel(update, context, item.id, page, message_id=message_id)
         await refresh_household_views(context, item.household_id)
@@ -1300,16 +851,40 @@ async def handle_delta(update: Update, context: ContextTypes.DEFAULT_TYPE, data:
     query = update.callback_query
     storage, user = record_user(update, context)
     parts = data.split(":")
-    item_id = int(parts[2])
-    delta = -1.0 if parts[3] == "minus" else 1.0
+    source_unit: str | None = None
+    try:
+        item_id = int(parts[2])
+        if data.startswith("v2:step:") and len(parts) == 6:
+            delta = float(parts[3])
+            page = int(parts[5])
+        elif data.startswith("v2:delta:") and len(parts) == 5 and parts[3] in {"minus", "plus"}:
+            delta = -1.0 if parts[3] == "minus" else 1.0
+            page = int(parts[4])
+        else:
+            raise ValueError("Invalid quantity button")
+        if not 0 < item_id < 2**63 or not 0 <= page < 2**31:
+            raise ValueError("Invalid quantity button")
+    except (ValueError, IndexError):
+        await query.answer("Кнопка устарела. Откройте товар заново.", show_alert=True)
+        return
     item = accessible_item(storage, user, item_id)
     if item is None or not item.active:
         await query.answer("Позиция больше недоступна.", show_alert=True)
         await show_stores_panel(update, context, message_id=query.message.message_id)
         return
-    updated = storage.change_item_quantity(item.store_id, user.chat_id, item.id, delta)
-    if updated is None:
-        await query.answer("Не получилось изменить остаток.", show_alert=True)
+    if data.startswith("v2:step:"):
+        tag = parts[4]
+        source_unit = {"g": "г", "kg": "кг", "ml": "мл", "l": "л"}.get(tag)
+        if source_unit is None and tag == ui.step_unit_tag(item.unit):
+            source_unit = item.unit
+        if source_unit is None or convert_quantity(delta, source_unit, item.unit) is None:
+            await query.answer("Единица измерения изменилась. Кнопки обновлены.", show_alert=True)
+            await show_item_panel(update, context, item.id, page, message_id=query.message.message_id)
+            return
+    try:
+        updated = InventoryService(storage, user.chat_id).change_quantity(item.id, delta, source_unit)
+    except ValueError as exc:
+        await query.answer(str(exc), show_alert=True)
         return
     await query.answer(f"Остаток: {format_quantity(updated.quantity)} {updated.unit}")
     await refresh_household_views(context, item.household_id)
@@ -1318,7 +893,10 @@ async def handle_delta(update: Update, context: ContextTypes.DEFAULT_TYPE, data:
 async def handle_v2_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     data = query.data or ""
-    if data.startswith("v2:delta:"):
+    if data == "v2:page_info":
+        await query.answer()
+        return
+    if data.startswith(("v2:delta:", "v2:step:")):
         await handle_delta(update, context, data)
         return
     await query.answer()
@@ -1489,7 +1067,10 @@ async def handle_v2_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 message_id=message_id,
             )
             return
-        if data == "v2:store_create":
+        if data.startswith("v2:store_settings:"):
+            await show_store_settings_panel(update, context, int(data.split(":")[2]), message_id=message_id)
+            return
+        if data == "v2:store_create" or data.startswith("v2:store_create_kind:"):
             household = storage.current_household(user.chat_id)
             if household is None:
                 await show_homes_panel(update, context, message_id=message_id)
@@ -1534,7 +1115,7 @@ async def handle_v2_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 message_id=message_id,
                 household_id=store.household_id,
                 store_id=store.id,
-                return_view="stores",
+                return_view="store_settings",
             )
             return
         if data.startswith("v2:store_delete_pick:"):
@@ -1551,7 +1132,7 @@ async def handle_v2_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 [
                     [
                         InlineKeyboardButton("Да, удалить", callback_data=f"v2:store_delete_yes:{store.id}"),
-                        InlineKeyboardButton("Отмена", callback_data="v2:store_edit"),
+                        InlineKeyboardButton("Отмена", callback_data=f"v2:store_settings:{store.id}:0"),
                     ]
                 ]
             )
@@ -1560,8 +1141,9 @@ async def handle_v2_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 user.chat_id,
                 text,
                 keyboard,
-                view_type="stores",
+                view_type="prompt",
                 household_id=store.household_id,
+                store_id=store.id,
                 message_id=message_id,
             )
             return
@@ -1630,7 +1212,9 @@ async def handle_v2_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if item is None:
                 await show_stores_panel(update, context, message_id=message_id)
                 return
-            text, keyboard = item_settings_panel(item, page)
+            text, keyboard = item_settings_panel(
+                item, page, storage.get_store(item.store_id), storage.get_household(item.household_id)
+            )
             await edit_or_send_panel(
                 context,
                 user.chat_id,
@@ -1813,7 +1397,9 @@ async def handle_v2_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if item is None or item.active:
                 await show_stores_panel(update, context, message_id=message_id)
                 return
-            text, keyboard = archived_item_panel(item, page)
+            text, keyboard = archived_item_panel(
+                item, page, storage.get_store(item.store_id), storage.get_household(item.household_id)
+            )
             await edit_or_send_panel(
                 context,
                 user.chat_id,
@@ -1854,7 +1440,7 @@ async def handle_v2_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 update,
                 context,
                 "buy_adjust",
-                f"Сколько купили у «{html.escape(item.name)}»?\n\n"
+                f"Сколько купили: «{html.escape(item.name)}»?\n\n"
                 f"Сейчас: {format_quantity(item.quantity)} {html.escape(item.unit)}.\n"
                 f"Напишите <code>2</code> или <code>2{html.escape(item.unit)}</code>.",
                 message_id=message_id,
@@ -1882,42 +1468,17 @@ async def quick_add(
 ) -> None:
     try:
         parsed = parse_amount_text(text)
+        item = InventoryService(storage, user.chat_id).add_item(
+            store.id, parsed.name, parsed.quantity,
+            parsed.unit if has_explicit_amount_unit(text) else None,
+            parsed.min_quantity, parsed.min_unit,
+        )
     except ValueError as exc:
         await update.message.reply_text(str(exc))
         return
-    existing = storage.find_item(store.id, parsed.name)
-    if existing:
-        quantity = (
-            convert_quantity(parsed.quantity, parsed.unit, existing.unit)
-            if has_explicit_amount_unit(text)
-            else parsed.quantity
-        )
-        if quantity is None:
-            await update.message.reply_text(
-                f"Склад «{store.name}»: для «{existing.name}» количество нужно указать в {existing.unit}."
-            )
-            return
-        minimum = minimum_in_item_unit(parsed, existing.unit)
-        item = storage.add_or_update_item(
-            store.id,
-            user.chat_id,
-            existing.name,
-            quantity,
-            existing.unit,
-            minimum,
-        )
-    else:
-        minimum = minimum_in_item_unit(parsed, parsed.unit)
-        item = storage.add_or_update_item(
-            store.id,
-            user.chat_id,
-            parsed.name,
-            parsed.quantity,
-            parsed.unit,
-            minimum,
-        )
     await update.message.reply_text(
-        f"{store.name} · {item.name}: {format_quantity(item.quantity)} {item.unit}."
+        f"{store.name} · {item.name}: {format_quantity(item.quantity)} {item.unit}.",
+        parse_mode=None,
     )
     await refresh_household_views(context, store.household_id)
 
@@ -1932,26 +1493,20 @@ async def quick_use(
 ) -> None:
     try:
         parsed = parse_amount_text(text)
-    except ValueError as exc:
-        await update.message.reply_text(str(exc))
-        return
-    item = storage.find_item(store.id, parsed.name)
-    if item is None:
-        await update.message.reply_text(f"Склад «{store.name}»: такая позиция не найдена.")
-        return
-    quantity = (
-        convert_quantity(parsed.quantity, parsed.unit, item.unit)
-        if has_explicit_amount_unit(text)
-        else parsed.quantity
-    )
-    if quantity is None:
-        await update.message.reply_text(
-            f"Склад «{store.name}»: для «{item.name}» количество нужно указать в {item.unit}."
+        service = InventoryService(storage, user.chat_id)
+        item = service.find_item(store.id, parsed.name)
+        if item is None:
+            await update.message.reply_text(f"Склад «{store.name}»: такая позиция не найдена.", parse_mode=None)
+            return
+        updated = service.change_quantity(
+            item.id, -parsed.quantity, parsed.unit if has_explicit_amount_unit(text) else None
         )
+    except ValueError as exc:
+        await update.message.reply_text(str(exc), parse_mode=None)
         return
-    updated = storage.change_item_quantity(store.id, user.chat_id, item.id, -quantity)
     await update.message.reply_text(
-        f"{store.name} · {updated.name}: {format_quantity(updated.quantity)} {updated.unit}."
+        f"{store.name} · {updated.name}: {format_quantity(updated.quantity)} {updated.unit}.",
+        parse_mode=None,
     )
     await refresh_household_views(context, store.household_id)
 
@@ -2070,6 +1625,7 @@ def build_app(settings: Settings) -> Application:
     application.bot_data["storage"] = Storage(settings.database_path)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("id", id_command))
     application.add_handler(CommandHandler("stock", show_stores_panel))
     application.add_handler(CommandHandler("buy", show_buy_panel))
     application.add_handler(CommandHandler("homes", show_homes_panel))

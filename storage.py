@@ -1,78 +1,26 @@
 from __future__ import annotations
 
+import math
 import secrets
 import sqlite3
 from contextlib import closing
-from dataclasses import dataclass
 from pathlib import Path
 
-
-@dataclass(frozen=True)
-class Household:
-    id: int
-    name: str
-    invite_code: str
-    owner_chat_id: int
-    created_at: str
-
-
-@dataclass(frozen=True)
-class Store:
-    id: int
-    household_id: int
-    name: str
-    created_at: str
+from storage_types import (
+    ActiveView,
+    Household,
+    InventoryItem,
+    Store,
+    User,
+    format_quantity,
+    normalize_name,
+)
 
 
-@dataclass(frozen=True)
-class InventoryItem:
-    id: int
-    household_id: int
-    store_id: int
-    name: str
-    normalized_name: str
-    quantity: float
-    unit: str
-    min_quantity: float
-    active: bool
-    notes: str | None
-    updated_at: str
-
-    @property
-    def is_low(self) -> bool:
-        return self.active and self.quantity <= self.min_quantity
-
-
-@dataclass(frozen=True)
-class User:
-    chat_id: int
-    username: str | None
-    first_name: str | None
-    current_household_id: int | None
-    current_store_id: int | None
-    last_seen: str | None
-
-
-@dataclass(frozen=True)
-class ActiveView:
-    chat_id: int
-    message_id: int
-    view_type: str
-    household_id: int | None
-    store_id: int | None
-    item_id: int | None
-    page: int
-    updated_at: str
-
-
-def normalize_name(value: str) -> str:
-    return " ".join(value.casefold().replace("ё", "е").split())
-
-
-def format_quantity(value: float) -> str:
-    if value == int(value):
-        return str(int(value))
-    return f"{value:.2f}".rstrip("0").rstrip(".")
+def _validate_amount(value: float, field: str, *, signed: bool = False) -> None:
+    if not math.isfinite(value) or (not signed and value < 0):
+        qualifier = "finite" if signed else "finite and nonnegative"
+        raise ValueError(f"{field} must be {qualifier}")
 
 
 class Storage:
@@ -173,6 +121,7 @@ class Storage:
                     """
                 )
                 self._ensure_default_stores(connection)
+                self._migrate_initial_extra_stores(connection)
 
     def record_user(self, chat_id: int, username: str | None, first_name: str | None) -> User:
         with closing(self._connect()) as connection:
@@ -217,7 +166,7 @@ class Storage:
                     """,
                     (household_id, chat_id),
                 )
-                store = self._create_store(connection, household_id, "Основной")
+                store = self._create_initial_stores(connection, household_id)
                 connection.execute(
                     """
                     UPDATE users
@@ -444,15 +393,20 @@ class Storage:
             connection.commit()
             return store
 
-    def create_store(self, chat_id: int, household_id: int, name: str) -> Store | None:
+    def create_store(
+        self,
+        chat_id: int,
+        household_id: int,
+        name: str,
+    ) -> Store | None:
         with closing(self._connect()) as connection:
             with connection:
                 if not self._is_member(connection, household_id, chat_id):
                     return None
                 store = self._create_store(connection, household_id, name)
                 connection.execute(
-                    "UPDATE users SET current_store_id = ? WHERE chat_id = ?",
-                    (store.id, chat_id),
+                    "UPDATE users SET current_household_id = ?, current_store_id = ? WHERE chat_id = ?",
+                    (household_id, store.id, chat_id),
                 )
                 return store
 
@@ -518,6 +472,9 @@ class Storage:
         unit: str,
         min_quantity: float | None = None,
     ) -> InventoryItem:
+        _validate_amount(quantity, "quantity")
+        if min_quantity is not None:
+            _validate_amount(min_quantity, "min_quantity")
         normalized_name = normalize_name(name)
         clean_name = " ".join(name.split())
         clean_unit = unit.strip() or "шт"
@@ -550,6 +507,7 @@ class Storage:
                     (store.household_id, store_id, clean_name, normalized_name, quantity, clean_unit, minimum, min_quantity),
                 )
                 item = self._get_item_by_name(connection, store_id, normalized_name)
+                _validate_amount(item.quantity, "resulting quantity")
                 connection.execute(
                     "INSERT INTO item_events (item_id, chat_id, action, delta) VALUES (?, ?, 'add', ?)",
                     (item.id, chat_id, quantity),
@@ -557,6 +515,7 @@ class Storage:
                 return item
 
     def set_item_quantity(self, store_id: int, chat_id: int, item_id: int, quantity: float) -> InventoryItem | None:
+        _validate_amount(quantity, "quantity")
         with closing(self._connect()) as connection:
             with connection:
                 item = self._get_item(connection, item_id)
@@ -582,6 +541,7 @@ class Storage:
                 return self._get_item(connection, item_id)
 
     def change_item_quantity(self, store_id: int, chat_id: int, item_id: int, delta: float) -> InventoryItem | None:
+        _validate_amount(delta, "delta", signed=True)
         with closing(self._connect()) as connection:
             with connection:
                 item = self._get_item(connection, item_id)
@@ -603,6 +563,7 @@ class Storage:
                 ).fetchone()
                 if row is None:
                     return None
+                _validate_amount(float(row["quantity"]), "resulting quantity")
                 connection.execute(
                     "INSERT INTO item_events (item_id, chat_id, action, delta) VALUES (?, ?, 'change_quantity', ?)",
                     (item_id, chat_id, delta),
@@ -616,6 +577,7 @@ class Storage:
         min_quantity: float,
         chat_id: int | None = None,
     ) -> InventoryItem | None:
+        _validate_amount(min_quantity, "min_quantity")
         with closing(self._connect()) as connection:
             with connection:
                 item = self._get_item(connection, item_id)
@@ -671,8 +633,10 @@ class Storage:
         quantity: float,
         min_quantity: float,
     ) -> InventoryItem | None:
+        _validate_amount(quantity, "quantity")
+        _validate_amount(min_quantity, "min_quantity")
         clean_unit = " ".join(unit.split())
-        if not clean_unit or quantity < 0 or min_quantity < 0:
+        if not clean_unit:
             return None
         with closing(self._connect()) as connection:
             with connection:
@@ -767,6 +731,11 @@ class Storage:
     def get_store(self, store_id: int) -> Store | None:
         with closing(self._connect()) as connection:
             return self._get_store(connection, store_id)
+
+    def get_household(self, household_id: int) -> Household | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute("SELECT * FROM households WHERE id = ?", (household_id,)).fetchone()
+            return self._row_to_household(row) if row else None
 
     def get_item(self, item_id: int) -> InventoryItem | None:
         with closing(self._connect()) as connection:
@@ -1025,7 +994,41 @@ class Storage:
         if column not in columns:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
-    def _create_store(self, connection: sqlite3.Connection, household_id: int, name: str) -> Store:
+    def _migrate_initial_extra_stores(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor = connection.execute(
+            """
+            INSERT INTO schema_migrations (name) VALUES ('seed_initial_extra_stores')
+            ON CONFLICT(name) DO NOTHING
+            """
+        )
+        if cursor.rowcount == 0:
+            return
+        for row in connection.execute("SELECT id FROM households ORDER BY id").fetchall():
+            self._create_initial_extra_stores(connection, int(row["id"]))
+
+    def _create_initial_stores(self, connection: sqlite3.Connection, household_id: int) -> Store:
+        store = self._create_store(connection, household_id, "Основной")
+        self._create_initial_extra_stores(connection, household_id)
+        return store
+
+    def _create_initial_extra_stores(self, connection: sqlite3.Connection, household_id: int) -> None:
+        for name in ("Морозилка", "Холодос"):
+            self._create_store(connection, household_id, name)
+
+    def _create_store(
+        self,
+        connection: sqlite3.Connection,
+        household_id: int,
+        name: str,
+    ) -> Store:
         clean_name = " ".join(name.split()) or "Основной"
         normalized = normalize_name(clean_name)
         connection.execute(

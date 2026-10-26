@@ -5,6 +5,8 @@ from __future__ import annotations
 import hmac
 import ipaddress
 import re
+from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 import uvicorn
@@ -15,6 +17,9 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from mcp_server import ConfigurationError, build_server
 from storage import Storage
+
+if TYPE_CHECKING:
+    from mcp_oauth import OAuthProvider
 
 
 _TOKEN = re.compile(r"[A-Za-z0-9._~+/-]+=*")
@@ -95,11 +100,13 @@ def validate_public_url(value: str | None) -> str | None:
 class _BearerMiddleware:
     """Authorize before routing or reading a request body; never log credentials."""
 
-    def __init__(self, app: ASGIApp, *, token: bytes, hosts: list[str], origins: list[str]) -> None:
+    def __init__(self, app: ASGIApp, *, token: bytes, hosts: list[str], origins: list[str],
+                 oauth: OAuthProvider | None = None) -> None:
         self.app = app
         self.token = token
         self.hosts = {host.encode("ascii") for host in hosts}
         self.origins = {origin.encode("ascii") for origin in origins}
+        self.oauth = oauth
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -113,19 +120,31 @@ class _BearerMiddleware:
             return
 
         headers = scope.get("headers", [])
+        hosts = [value for name, value in headers if name.lower() == b"host"]
+        if self.oauth is not None and (scope["method"], scope["path"]) in self.oauth.public_routes:
+            if len(hosts) != 1 or hosts[0] not in self.hosts:
+                await Response("Invalid Host header", status_code=421)(scope, receive, send)
+            else:
+                await self.app(scope, receive, send)
+            return
         authorization = [value for name, value in headers if name.lower() == b"authorization"]
         match = _AUTHORIZATION.fullmatch(authorization[0]) if len(authorization) == 1 else None
-        if match is None or not hmac.compare_digest(match.group(1), self.token):
+        authorized = match is not None and hmac.compare_digest(match.group(1), self.token)
+        if not authorized and match is not None and self.oauth is not None:
+            authorized = await self.oauth.verify_token(match.group(1).decode("ascii"))
+        if not authorized:
+            challenge = "Bearer"
+            if self.oauth is not None:
+                challenge += f' resource_metadata="{self.oauth.resource_metadata_url}"'
             response = Response(
                 "Unauthorized", status_code=401,
-                headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
+                headers={"WWW-Authenticate": challenge, "Cache-Control": "no-store"},
             )
             await response(scope, receive, send)
             return
 
         # Reject ambiguous headers before the SDK examines their first value.
         # The SDK retains its own DNS-rebinding checks on the MCP endpoint.
-        hosts = [value for name, value in headers if name.lower() == b"host"]
         origins = [value for name, value in headers if name.lower() == b"origin"]
         if len(hosts) != 1 or hosts[0] not in self.hosts:
             response = Response("Invalid Host header", status_code=421)
@@ -144,6 +163,7 @@ def create_http_app(
     *,
     allowed_hosts: list[str],
     allowed_origins: list[str],
+    oauth: OAuthProvider | None = None,
 ) -> Starlette:
     """Create the authenticated app, retaining the SDK's MCP ASGI lifespan."""
     if not isinstance(token, str) or _TOKEN.fullmatch(token) is None:
@@ -169,7 +189,9 @@ def create_http_app(
             allowed_origins=origins,
         ),
     )
-    app.add_middleware(_BearerMiddleware, token=token.encode("ascii"), hosts=hosts, origins=origins)
+    if oauth is not None:
+        app.router.routes.extend(oauth.create_routes())
+    app.add_middleware(_BearerMiddleware, token=token.encode("ascii"), hosts=hosts, origins=origins, oauth=oauth)
     return app
 
 
@@ -181,6 +203,7 @@ def serve_http(
     host: str,
     port: int,
     public_url: str | None,
+    oauth_database: Path | None = None,
 ) -> None:
     """Run HTTP with exact local/public allowlists and no request access log."""
     if type(port) is not int or not 1 <= port <= 65535:
@@ -203,7 +226,12 @@ def serve_http(
         allowed_origins.append(public_origin)
         if (public.scheme, public.port) in {("https", 443), ("http", 80)}:
             allowed_origins.append(f"{public.scheme}://{allowed_hosts[-1]}")
-    app = create_http_app(
-        storage, user_id, token, allowed_hosts=allowed_hosts, allowed_origins=allowed_origins,
-    )
+    options = {"allowed_hosts": allowed_hosts, "allowed_origins": allowed_origins}
+    if oauth_database is not None:
+        if public_origin is None:
+            raise ConfigurationError("OAuth requires a configured HTTPS public origin.")
+        from mcp_oauth import OAuthProvider
+
+        options["oauth"] = OAuthProvider(oauth_database, public_origin)
+    app = create_http_app(storage, user_id, token, **options)
     uvicorn.run(app, host=host, port=port, access_log=False, log_level="info")

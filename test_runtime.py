@@ -389,7 +389,10 @@ def test_runner_passes_bound_context_and_host_port_without_output(inventory, tmp
     args, kwargs = calls[0]
     assert isinstance(args[0], Storage) and args[0].path == data_dir / "home_warehouse_bot.sqlite3"
     assert args[1:] == (101, TOKEN)
-    assert kwargs == {"host": "0.0.0.0", "port": 8080, "public_url": "https://synthetic.example"}
+    assert kwargs == {
+        "host": "0.0.0.0", "port": 8080, "public_url": "https://synthetic.example",
+        "oauth_database": data_dir / "oauth.sqlite3",
+    }
     assert capsys.readouterr() == ("", "")
 
 

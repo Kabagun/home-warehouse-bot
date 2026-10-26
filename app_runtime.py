@@ -364,6 +364,7 @@ def main(environ: Mapping[str, str] | None = None) -> int:
             host=settings.host,
             port=settings.port,
             public_url=context.public_url,
+            oauth_database=settings.data_dir / "oauth.sqlite3" if context.public_url else None,
         )
         return 0
     except Exception:

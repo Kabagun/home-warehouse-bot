@@ -60,7 +60,9 @@ MAX_GRANTS = 10000
 MAX_REFRESH_HISTORY = 100000
 _COOKIE = "__Host-warehouse-oauth-csrf"
 _HEADERS = {
-    "Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer",
+    # no-referrer makes navigation POSTs send Origin:null, including our own
+    # consent form. Preserve same-origin checks without leaking cross-origin referrers.
+    "Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "same-origin",
     "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
 }

@@ -126,7 +126,7 @@ async def test_sdk_discovery_dcr_consent_pkce_and_restart(client, provider):
     assert len(re.findall(r"<li>", page.text)) == 12
     assert "Разрешить доступ" in page.text and "Отказать" in page.text
     assert "HttpOnly" in page.headers["set-cookie"] and "Secure" in page.headers["set-cookie"]
-    assert page.headers["referrer-policy"] == "no-referrer"
+    assert page.headers["referrer-policy"] == "same-origin"
     restarted = OAuthProvider(provider.database_path, ISSUER)
     assert await restarted.verify_token(result["access_token"])
     loaded = await restarted.load_access_token(result["access_token"])
@@ -232,7 +232,10 @@ async def test_missing_token_resource_inherits_grant_but_wrong_authorization_res
 @pytest.mark.anyio
 async def test_consent_requires_owner_code_cookie_origin_csrf_and_explicit_approval(client, provider):
     registration = await register(client)
-    fields, _ = await begin(client, registration)
+    fields, page = await begin(client, registration)
+    # Navigation form POSTs serialize Origin as null under no-referrer. Keep
+    # the browser-compatible policy and continue rejecting null/missing origins.
+    assert page.headers["referrer-policy"] == "same-origin"
     owner_code = provider.issue_owner_code()
     data = {**fields, "code": owner_code, "decision": "allow"}
     cases = [({}, data), ({"Origin": "null"}, data), ({"Origin": "https://attacker.example.test"}, data),

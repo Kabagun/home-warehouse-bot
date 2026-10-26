@@ -394,6 +394,41 @@ async def test_escaped_consent_does_not_render_client_html(client, provider):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("callback,origin", [
+    (CALLBACK, "https://client.example.test"),
+    ("https://another.example.test:8443/callback?registered=value", "https://another.example.test:8443"),
+    ("http://127.0.0.1:8787/callback", "http://127.0.0.1:8787"),
+])
+async def test_consent_csp_allows_only_registered_callback_origin_and_keeps_other_pages_strict(client, provider, callback, origin):
+    registration = await register(client, redirect_uris=[callback])
+    fields, page = await begin(client, registration, redirect_uri=callback)
+
+    def directives(response):
+        return {parts[0]: parts[1:] for directive in response.headers["content-security-policy"].split(";")
+                if (parts := directive.split())}
+
+    policy = directives(page)
+    assert policy["form-action"] == ["'self'", origin]
+    assert policy["default-src"] == ["'none'"]
+    assert policy["base-uri"] == ["'none'"]
+    assert policy["frame-ancestors"] == ["'none'"]
+    assert page.headers["referrer-policy"] == "same-origin"
+    # Building a client-specific document must not broaden the shared headers.
+    metadata = await client.get("/.well-known/oauth-authorization-server")
+    assert directives(metadata)["form-action"] == ["'self'"]
+    error = await client.get("/oauth/consent?request=unknown")
+    assert error.status_code == 400
+    assert directives(error)["form-action"] == ["'self'"]
+    approved = await client.post("/oauth/consent", data={
+        **fields, "code": provider.issue_owner_code(), "decision": "allow",
+    }, headers={"Origin": ISSUER})
+    assert approved.status_code == 302
+    target = urlsplit(approved.headers["location"])
+    assert f"{target.scheme}://{target.netloc}" == origin
+    assert "code" in parse_qs(target.query)
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("metadata", [
     {"redirect_uris": ["http://remote.example.test/callback"]},
     {"redirect_uris": ["https://user:password@example.test/callback"]},

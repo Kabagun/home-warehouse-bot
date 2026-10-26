@@ -588,7 +588,15 @@ class OAuthProvider(OAuthAuthorizationServerProvider[_AuthorizationCode, _Refres
 
     @staticmethod
     def _consent_page(params, nonce, csrf, client_name):
-        callback = urlsplit(str(params.redirect_uri)).netloc
+        callback_url = urlsplit(str(params.redirect_uri))
+        callback = callback_url.netloc
+        callback_origin = f"{callback_url.scheme}://{callback}"
+        # Chromium checks form-action across the POST's redirect chain. Allow
+        # only this request's previously validated registered callback origin.
+        headers = dict(_HEADERS)
+        headers["Content-Security-Policy"] = headers["Content-Security-Policy"].replace(
+            "form-action 'self';", f"form-action 'self' {callback_origin};",
+        )
         fields = "".join(f'<input type="hidden" name="{name}" value="{html.escape(value, quote=True)}">'
                          for name, value in (("request", nonce), ("csrf", csrf)))
         operations = "".join(f"<li>{html.escape(label)}</li>" for label in _TOOL_SUMMARY)
@@ -604,7 +612,7 @@ class OAuthProvider(OAuthAuthorizationServerProvider[_AuthorizationCode, _Refres
             '<button type="submit" name="decision" value="allow">Разрешить доступ</button>'
             '<button type="submit" name="decision" value="deny">Отказать</button></form></main></html>'
         )
-        return HTMLResponse(page, headers=_HEADERS)
+        return HTMLResponse(page, headers=headers)
 
     @staticmethod
     def _error_page(message, status=400):

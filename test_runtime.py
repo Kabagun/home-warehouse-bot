@@ -68,7 +68,8 @@ def test_unique_registered_member_owner_is_selected_without_changing_profile(inv
     assert runtime.storage.get_user(101) == profile
     assert fingerprint(storage.path) == before
     saved = json.loads((data_dir / "mcp-settings.json").read_text())
-    assert saved == {"auth_token": TOKEN, "user_id": 101}
+    assert saved == {"auth_token": TOKEN, "user_id": 101, "profile_id": runtime.profile_id}
+    assert runtime.profile_id.startswith("prf_") and len(runtime.profile_id) == 47
     assert str(101) not in repr(runtime) and TOKEN not in repr(runtime)
 
 
@@ -252,9 +253,38 @@ def test_saved_configuration_remains_stable_across_restarts(inventory, tmp_path)
     original_inode = path.stat().st_ino
     bootstrap.unlink()
     second = prepare_runtime(settings_for(data_dir))
-    assert (second.user_id, second.auth_token) == (first.user_id, first.auth_token)
+    assert (second.user_id, second.auth_token, second.profile_id) == (first.user_id, first.auth_token, first.profile_id)
     assert path.read_bytes() == original
     assert path.stat().st_ino == original_inode
+
+
+def test_legacy_settings_gain_one_stable_profile_without_changing_credentials_or_inventory(inventory):
+    storage, data_dir = inventory
+    original = {"auth_token": TOKEN, "user_id": 101, "public_url": "https://synthetic.example"}
+    path = private_json(data_dir / "mcp-settings.json", original)
+    before = fingerprint(storage.path)
+    first = prepare_runtime(settings_for(data_dir))
+    saved = json.loads(path.read_text())
+    assert saved == {**original, "profile_id": first.profile_id}
+    # Changing a credential in protected configuration does not change identity.
+    private_json(path, {**saved, "auth_token": OTHER_TOKEN})
+    second = prepare_runtime(settings_for(data_dir))
+    assert second.profile_id == first.profile_id
+    assert second.auth_token == OTHER_TOKEN and second.user_id == first.user_id
+    assert second.public_url == first.public_url
+    assert fingerprint(storage.path) == before
+
+
+@pytest.mark.parametrize("profile_id", [None, "", " ", "synthetic@example.test", "prf_short", 101])
+def test_invalid_saved_profile_is_rejected_without_replacing_identity(inventory, profile_id):
+    storage, data_dir = inventory
+    path = private_json(data_dir / "mcp-settings.json", {"auth_token": TOKEN, "user_id": 101, "profile_id": profile_id})
+    saved = path.read_bytes()
+    before = fingerprint(storage.path)
+    with pytest.raises(ConfigurationError, match="profile ID"):
+        prepare_runtime(settings_for(data_dir))
+    assert path.read_bytes() == saved and fingerprint(storage.path) == before
+    assert not (data_dir / "backups").exists()
 
 
 def test_second_bootstrap_updates_public_url_and_env_override_persists(inventory, tmp_path):
@@ -267,7 +297,7 @@ def test_second_bootstrap_updates_public_url_and_env_override_persists(inventory
     runtime = prepare_runtime(settings_for(data_dir, MCP_PUBLIC_URL="https://override.example"))
     assert runtime.public_url == "https://override.example"
     saved = json.loads((data_dir / "mcp-settings.json").read_text())
-    assert saved == {"auth_token": TOKEN, "user_id": 101, "public_url": "https://override.example"}
+    assert saved == {"auth_token": TOKEN, "user_id": 101, "public_url": "https://override.example", "profile_id": runtime.profile_id}
     assert prepare_runtime(settings_for(data_dir)).public_url == "https://override.example"
 
 
@@ -392,6 +422,7 @@ def test_runner_passes_bound_context_and_host_port_without_output(inventory, tmp
     assert kwargs == {
         "host": "0.0.0.0", "port": 8080, "public_url": "https://synthetic.example",
         "oauth_database": data_dir / "oauth.sqlite3",
+        "profile_id": json.loads((data_dir / "mcp-settings.json").read_text())["profile_id"],
     }
     assert capsys.readouterr() == ("", "")
 

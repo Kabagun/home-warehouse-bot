@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 import stat
 import struct
@@ -21,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from mcp_server import ConfigurationError, MCPSettings, validate_database_schema, validate_user_id
+from mcp_server import ConfigurationError, MCPSettings, validate_database_schema, validate_profile_id, validate_user_id
 from storage import Storage
 
 
@@ -87,6 +88,7 @@ class RuntimeContext:
     user_id: int = field(repr=False)
     auth_token: str = field(repr=False)
     public_url: str | None = field(default=None, repr=False)
+    profile_id: str | None = field(default=None, repr=False)
 
 
 def _private_file(path: Path) -> int:
@@ -320,7 +322,7 @@ def prepare_runtime(settings: RuntimeSettings) -> RuntimeContext:
     exists = path.exists() or path.is_symlink()
     saved = _read_private_json(path) if exists else {}
     if exists:
-        if set(saved) - {"auth_token", "user_id", "public_url"} or not {"auth_token", "user_id"} <= saved.keys():
+        if set(saved) - {"auth_token", "user_id", "public_url", "profile_id"} or not {"auth_token", "user_id"} <= saved.keys():
             raise ConfigurationError("Use a valid protected runtime configuration.")
         token = _validate_token(saved["auth_token"])
         user_id = _bind_identity(settings.database_path, {"user_id": saved["user_id"]})
@@ -340,7 +342,10 @@ def prepare_runtime(settings: RuntimeSettings) -> RuntimeContext:
     bootstrap_url = validate_public_url(bootstrap.get("public_url"))
     override_url = validate_public_url(settings.public_url)
     public_url = override_url or bootstrap_url or saved_url
-    configuration: dict[str, Any] = {"auth_token": token, "user_id": user_id}
+    # Profile identity belongs to the configured principal, not a credential,
+    # connection, or display label. Migrate once; never replace an invalid ID.
+    profile_id = validate_profile_id(saved["profile_id"]) if "profile_id" in saved else "prf_" + secrets.token_urlsafe(32)
+    configuration: dict[str, Any] = {"auth_token": token, "user_id": user_id, "profile_id": profile_id}
     if public_url is not None:
         configuration["public_url"] = public_url
 
@@ -348,7 +353,7 @@ def prepare_runtime(settings: RuntimeSettings) -> RuntimeContext:
     storage = MCPSettings(settings.database_path, user_id).open_storage()
     if configuration != saved or not exists:
         _write_private_json(path, configuration, replace=exists)
-    return RuntimeContext(storage, user_id, token, public_url)
+    return RuntimeContext(storage, user_id, token, public_url, profile_id=profile_id)
 
 
 def main(environ: Mapping[str, str] | None = None) -> int:
@@ -364,6 +369,7 @@ def main(environ: Mapping[str, str] | None = None) -> int:
             host=settings.host,
             port=settings.port,
             public_url=context.public_url,
+            profile_id=context.profile_id,
             oauth_database=settings.data_dir / "oauth.sqlite3" if context.public_url else None,
         )
         return 0

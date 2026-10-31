@@ -77,6 +77,54 @@ async def test_complete_public_oauth_flow_opens_scoped_mcp_and_keeps_static_bear
 
 
 @pytest.mark.anyio
+async def test_profile_uses_authenticated_fixed_identity_across_refresh_and_reconnection(inventory, oauth):
+    profile_id = "prf_" + "p" * 43
+    expected = {"id": profile_id, "name": "Склад", "nickname": "Дом"}
+    app = create_http_app(
+        inventory[0], 101, TOKEN, allowed_hosts=["inventory.example.test"],
+        allowed_origins=[ISSUER], oauth=oauth, profile_id=profile_id,
+    )
+    before = inventory[0].path.read_bytes()
+    request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_profile", "arguments": {}}}
+    async with http_client(app) as http:
+        assert (await http.post("/mcp", json=request)).status_code == 401
+
+        async def profile(credential):
+            http.headers["Authorization"] = "Bearer " + credential
+            try:
+                async with Client(streamable_http_client(RESOURCE, http_client=http)) as connected:
+                    tools = (await connected.list_tools()).tools
+                    assert {tool.name for tool in tools} == TOOL_NAMES | {"get_profile"}
+                    assert next(tool for tool in tools if tool.name == "get_profile").meta["openai/profile"] is True
+                    return await call(connected, "get_profile")
+            finally:
+                del http.headers["Authorization"]
+
+        assert await profile(TOKEN) == expected
+        registration = await register(http)
+        issued, *_ = await tokens(http, oauth, registration)
+        assert await profile(issued["access_token"]) == expected
+        rotated = await http.post("/token", data={
+            "grant_type": "refresh_token", "client_id": registration["client_id"],
+            "refresh_token": issued["refresh_token"], "resource": RESOURCE,
+        })
+        assert rotated.status_code == 200
+        renewed = rotated.json()
+        assert await profile(renewed["access_token"]) == expected
+        revoked = await http.post("/revoke", data={
+            "client_id": registration["client_id"], "token": renewed["refresh_token"],
+        })
+        assert revoked.status_code == 200
+        for access in (issued["access_token"], renewed["access_token"]):
+            denied = await http.post("/mcp", headers={"Authorization": "Bearer " + access}, json=request)
+            assert denied.status_code == 401 and profile_id not in denied.text
+        reconnected, *_ = await tokens(http, oauth, registration)
+        assert await profile(reconnected["access_token"]) == expected
+        assert await profile(TOKEN) == expected
+    assert inventory[0].path.read_bytes() == before
+
+
+@pytest.mark.anyio
 async def test_refresh_preserves_existing_access_and_revocation_invalidates_family(combined_app, oauth):
     async with http_client(combined_app) as http:
         registration = await register(http)

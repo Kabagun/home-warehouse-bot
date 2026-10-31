@@ -18,6 +18,9 @@ from mcp_server import ConfigurationError, MCPSettings, build_server
 from storage import Storage
 
 
+PROFILE_ID = "prf_" + "a" * 43
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
@@ -111,6 +114,52 @@ async def test_tools_have_structured_schemas_annotations_and_no_identity_argumen
     assert by_name["restore_item"].annotations.idempotent_hint is True
     assert set(by_name["create_store"].input_schema["properties"]) == {"household_id", "name"}
     assert set(by_name["create_store"].output_schema["properties"]) == {"id", "household_id", "name"}
+
+
+@pytest.mark.anyio
+async def test_profile_tool_is_flat_strict_readonly_and_uses_configured_identity(inventory):
+    storage, *_ = inventory
+    before = storage.path.read_bytes()
+    async with Client(build_server(storage, 101, profile_id=PROFILE_ID)) as connected:
+        tools = (await connected.list_tools()).tools
+        assert len(tools) == 13
+        profile_tool = next(tool for tool in tools if tool.name == "get_profile")
+        assert profile_tool.meta == {"openai/profile": True, "securitySchemes": [{"type": "oauth2", "scopes": ["inventory"]}]}
+        assert profile_tool.input_schema["properties"] == {}
+        assert profile_tool.input_schema["additionalProperties"] is False
+        assert profile_tool.output_schema["additionalProperties"] is False
+        assert set(profile_tool.output_schema["properties"]) == {"id", "name", "nickname"}
+        assert profile_tool.output_schema["properties"]["id"]["minLength"] == 1
+        assert profile_tool.output_schema["properties"]["id"]["pattern"] == r"\S"
+        assert profile_tool.annotations.read_only_hint is True
+        assert profile_tool.annotations.destructive_hint is False
+        assert profile_tool.annotations.open_world_hint is False
+        expected = {"id": PROFILE_ID, "name": "Склад", "nickname": "Дом"}
+        for _ in range(2):
+            result = await connected.call_tool("get_profile", {})
+            assert not result.is_error and result.structured_content == expected
+            assert json.loads(result.content[0].text) == expected
+        assert (await connected.call_tool("get_profile", {"user_id": 202})).is_error
+    assert storage.path.read_bytes() == before
+    async with Client(build_server(storage, 101, profile_id=PROFILE_ID)) as restarted:
+        assert await call(restarted, "get_profile") == expected
+
+
+@pytest.mark.anyio
+async def test_profile_tool_rejects_missing_configured_principal(inventory):
+    storage, *_ = inventory
+    server = build_server(storage, 101, profile_id=PROFILE_ID)
+    with sqlite3.connect(storage.path) as connection:
+        connection.execute("DELETE FROM users WHERE chat_id = 101")
+    async with Client(server) as connected:
+        result = await connected.call_tool("get_profile", {})
+        assert result.is_error and not result.structured_content
+
+
+@pytest.mark.parametrize("profile_id", ["", " ", "synthetic@example.test", 101])
+def test_profile_tool_requires_a_valid_persisted_profile_identity(inventory, profile_id):
+    with pytest.raises(ConfigurationError, match="profile ID"):
+        build_server(inventory[0], 101, profile_id=profile_id)
 
 
 @pytest.mark.anyio

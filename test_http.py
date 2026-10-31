@@ -260,7 +260,9 @@ def test_runner_uses_explicit_allowlists_sdk_lifespan_and_disables_access_log(in
     run = Mock()
     monkeypatch.setattr(mcp_http, "create_http_app", create)
     monkeypatch.setattr(mcp_http.uvicorn, "run", run)
-    serve_http(inventory[0], 101, TOKEN, host="0.0.0.0", port=8000, public_url=public_url)
+    profile_id = "prf_" + "h" * 43
+    serve_http(inventory[0], 101, TOKEN, host="0.0.0.0", port=8000, public_url=public_url, profile_id=profile_id)
+    assert create.call_args.kwargs["profile_id"] == profile_id
     hosts = create.call_args.kwargs["allowed_hosts"]
     origins = create.call_args.kwargs["allowed_origins"]
     assert {"127.0.0.1:8000", "localhost:8000", "[::1]:8000"} <= set(hosts)

@@ -23,7 +23,7 @@ from typing import Annotated, Any, ParamSpec, TypeVar
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from inventory_service import InventoryService
 from storage import Household, InventoryItem, Storage, Store
@@ -98,6 +98,12 @@ def parse_user_id(value: str | None) -> int:
 def validate_user_id(user_id: int) -> None:
     if type(user_id) is not int or not user_id or not -(2**63) <= user_id < 2**63:
         raise ConfigurationError("MCP_USER_ID must be a nonzero signed 64-bit integer.")
+
+
+def validate_profile_id(value: Any) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"prf_[A-Za-z0-9_-]{43}", value) is None:
+        raise ConfigurationError("Use the existing opaque profile ID from protected runtime configuration.")
+    return value
 
 
 def database_path(value: str | Path) -> Path:
@@ -220,6 +226,14 @@ def initialize_database(path: str | Path, user_id: int, household_name: str) -> 
         raise ConfigurationError("Cannot initialize the inventory database.") from None
 
 
+class ProfileResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", json_schema_extra={"$schema": "https://json-schema.org/draft/2020-12/schema"})
+
+    id: str = Field(min_length=1, pattern=r"\S", description="Opaque profile identity, unchanged across token refresh and reconnection.")
+    name: str
+    nickname: str
+
+
 class HouseholdResult(BaseModel):
     id: int
     name: str
@@ -329,7 +343,7 @@ Delta = Annotated[float, Field(allow_inf_nan=False, strict=True)]
 Name = Annotated[str, Field(min_length=1)]
 
 
-def build_server(storage: Storage, user_id: int) -> MCPServer:
+def build_server(storage: Storage, user_id: int, *, profile_id: str | None = None) -> MCPServer:
     """Build a server bound to one registered user; useful for embedding/tests."""
     service = InventoryService(storage, user_id)
     server = InventoryMCPServer(
@@ -342,6 +356,19 @@ def build_server(storage: Storage, user_id: int) -> MCPServer:
         ),
         log_level="WARNING",
     )
+
+    if profile_id is not None:
+        profile_id = validate_profile_id(profile_id)
+
+        @server.tool(
+            annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False),
+            meta={"openai/profile": True, "securitySchemes": [{"type": "oauth2", "scopes": ["inventory"]}]},
+        )
+        @domain_errors
+        def get_profile() -> ProfileResult:
+            """Return the authenticated configured profile, with a stable identity across reconnections."""
+            service.require_user()
+            return ProfileResult(id=profile_id, name="Склад", nickname="Дом")
 
     @server.tool(annotations=READ)
     @domain_errors

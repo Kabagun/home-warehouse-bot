@@ -164,6 +164,7 @@ def create_http_app(
     allowed_hosts: list[str],
     allowed_origins: list[str],
     oauth: OAuthProvider | None = None,
+    profile_id: str | None = None,
 ) -> Starlette:
     """Create the authenticated app, retaining the SDK's MCP ASGI lifespan."""
     if not isinstance(token, str) or _TOKEN.fullmatch(token) is None:
@@ -180,7 +181,7 @@ def create_http_app(
             raise ConfigurationError("HTTP allowed origins must be exact origins without a trailing slash.")
         origins.append(validated)
 
-    app = build_server(storage, user_id).streamable_http_app(
+    app = build_server(storage, user_id, profile_id=profile_id).streamable_http_app(
         streamable_http_path="/mcp",
         stateless_http=True,
         transport_security=TransportSecuritySettings(
@@ -204,6 +205,7 @@ def serve_http(
     port: int,
     public_url: str | None,
     oauth_database: Path | None = None,
+    profile_id: str | None = None,
 ) -> None:
     """Run HTTP with exact local/public allowlists and no request access log."""
     if type(port) is not int or not 1 <= port <= 65535:
@@ -226,7 +228,7 @@ def serve_http(
         allowed_origins.append(public_origin)
         if (public.scheme, public.port) in {("https", 443), ("http", 80)}:
             allowed_origins.append(f"{public.scheme}://{allowed_hosts[-1]}")
-    options = {"allowed_hosts": allowed_hosts, "allowed_origins": allowed_origins}
+    options = {"allowed_hosts": allowed_hosts, "allowed_origins": allowed_origins, "profile_id": profile_id}
     if oauth_database is not None:
         if public_origin is None:
             raise ConfigurationError("OAuth requires a configured HTTPS public origin.")

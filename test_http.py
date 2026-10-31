@@ -24,6 +24,7 @@ BASE_URL = "https://inventory.example.test"
 TOOL_NAMES = {
     "list_households", "create_household", "list_stores", "create_store", "list_items", "add_item",
     "change_item_quantity", "set_item_quantity", "set_item_minimum", "archive_item", "restore_item", "shopping_list",
+    "preview_deletion", "delete_item", "delete_store", "delete_household",
 }
 
 
@@ -109,6 +110,26 @@ async def test_real_http_sdk_negotiation_tools_and_inventory(app, inventory, mod
 
 
 @pytest.mark.anyio
+async def test_http_deletion_uses_preview_across_stateless_clients_and_strict_confirmation(app, inventory):
+    storage, _, store, *_ = inventory
+    async with http_client(app, headers={"Authorization": f"Bearer {TOKEN}"}) as http:
+        async with Client(streamable_http_client(f"{BASE_URL}/mcp", http_client=http)) as connected:
+            item = await call(connected, "add_item", store_id=store.id, name="Disposable stock", quantity=1)
+            preview = await call(connected, "preview_deletion", target_type="item", target_id=item["id"])
+            unconfirmed = await connected.call_tool("delete_item", {
+                "item_id": item["id"], "preview_token": preview["preview_token"],
+            })
+            assert unconfirmed.is_error and storage.get_item(item["id"]) is not None
+        async with Client(streamable_http_client(f"{BASE_URL}/mcp", http_client=http)) as reconnected:
+            arguments = {"item_id": item["id"], "preview_token": preview["preview_token"]}
+            assert (await reconnected.call_tool("delete_item", {**arguments, "confirmed": "true"})).is_error
+            receipt = await call(reconnected, "delete_item", **arguments, confirmed=True)
+            assert receipt["deleted"] is True and receipt["active_items"] == 1
+            assert (await reconnected.call_tool("delete_item", {**arguments, "confirmed": True})).is_error
+    assert storage.get_item(item["id"]) is None
+
+
+@pytest.mark.anyio
 async def test_http_tools_keep_household_isolation_and_fixed_identity(app, inventory):
     storage, home, store, other_home, other_store, other_item = inventory
     async with http_client(app, headers={"Authorization": f"Bearer {TOKEN}"}) as http:
@@ -121,6 +142,10 @@ async def test_http_tools_keep_household_isolation_and_fixed_identity(app, inven
                 ("add_item", {"store_id": other_store.id, "name": "Blocked item", "quantity": 1}),
                 ("set_item_quantity", {"item_id": other_item.id, "quantity": 0}),
                 ("archive_item", {"item_id": other_item.id}),
+                ("preview_deletion", {"target_type": "store", "target_id": other_store.id}),
+                ("delete_item", {"item_id": other_item.id, "preview_token": "untrusted-token", "confirmed": True}),
+                ("delete_store", {"store_id": other_store.id, "preview_token": "untrusted-token", "confirmed": True}),
+                ("delete_household", {"household_id": other_home.id, "preview_token": "untrusted-token", "confirmed": True}),
                 ("list_items", {"store_id": store.id, "chat_id": 202}),
             ]:
                 result = await connected.call_tool(name, arguments)
@@ -210,7 +235,7 @@ async def test_valid_token_still_requires_trusted_host_and_origin(app, inventory
 async def test_explicit_trusted_origin_works_without_cors_or_oauth_discovery(app):
     async with http_client(app, headers={"Authorization": f"bEaReR {TOKEN}", "Origin": BASE_URL}) as http:
         async with Client(streamable_http_client(f"{BASE_URL}/mcp", http_client=http)) as connected:
-            assert len((await connected.list_tools()).tools) == 12
+            assert len((await connected.list_tools()).tools) == 16
         discovery = await http.get("/.well-known/oauth-protected-resource")
         assert discovery.status_code == 404
         assert "access-control-allow-origin" not in discovery.headers

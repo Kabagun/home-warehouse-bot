@@ -6,6 +6,8 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
+import inventory_deletion
+
 from storage_types import (
     ActiveView,
     Household,
@@ -123,6 +125,7 @@ class Storage:
                     )
                     """
                 )
+                inventory_deletion.initialize(connection)
                 self._ensure_default_stores(connection)
                 self._migrate_initial_extra_stores(connection)
 
@@ -465,6 +468,18 @@ class Storage:
                     (replacement.id if replacement else None, store.household_id, store_id),
                 )
                 return True
+
+    def preview_deletion(self, chat_id: int, target_type: str, target_id: int) -> dict:
+        with closing(self._connect()) as connection:
+            with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                return inventory_deletion.preview(connection, chat_id, target_type, target_id)
+
+    def delete_reviewed(self, chat_id: int, target_type: str, target_id: int, preview_token: str) -> dict:
+        with closing(self._connect()) as connection:
+            with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                return inventory_deletion.delete_reviewed(connection, chat_id, target_type, target_id, preview_token)
 
     def add_or_update_item(
         self,

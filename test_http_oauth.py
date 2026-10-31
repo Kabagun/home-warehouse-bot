@@ -34,7 +34,7 @@ def combined_app(inventory, oauth):
 @pytest.mark.anyio
 @pytest.mark.parametrize("client_method", ["none", "client_secret_basic"])
 async def test_complete_public_oauth_flow_opens_scoped_mcp_and_keeps_static_bearer(combined_app, inventory, oauth, client_method):
-    _, home, _, other_home, *_ = inventory
+    storage, home, store, other_home, *_ = inventory
     requests = set()
 
     async def capture(request):
@@ -56,12 +56,16 @@ async def test_complete_public_oauth_flow_opens_scoped_mcp_and_keeps_static_bear
         http.headers["Authorization"] = "Bearer " + issued["access_token"]
         async with Client(streamable_http_client(RESOURCE, http_client=http)) as connected:
             assert {tool.name for tool in (await connected.list_tools()).tools} == TOOL_NAMES
-            assert len(TOOL_NAMES) == 12
+            assert len(TOOL_NAMES) == 16
             assert await call(connected, "list_households") == {
                 "households": [{"id": home.id, "name": "Synthetic home"}],
             }
             foreign = await connected.call_tool("list_stores", {"household_id": other_home.id})
             assert foreign.is_error
+            item = await call(connected, "add_item", store_id=store.id, name="OAuth disposable stock", quantity=1)
+            preview = await call(connected, "preview_deletion", target_type="item", target_id=item["id"])
+            receipt = await call(connected, "delete_item", item_id=item["id"], preview_token=preview["preview_token"], confirmed=True)
+            assert receipt["deleted"] is True and storage.get_item(item["id"]) is None
         http.headers["Authorization"] = "Bearer " + TOKEN
         async with Client(streamable_http_client(RESOURCE, http_client=http), mode="legacy") as connected:
             assert {tool.name for tool in (await connected.list_tools()).tools} == TOOL_NAMES
@@ -150,7 +154,7 @@ async def test_refresh_preserves_existing_access_and_revocation_invalidates_fami
             assert denied.status_code == 401
         http.headers["Authorization"] = "Bearer " + TOKEN
         async with Client(streamable_http_client(RESOURCE, http_client=http)) as connected:
-            assert len((await connected.list_tools()).tools) == 12
+            assert len((await connected.list_tools()).tools) == 16
 
 
 @pytest.mark.anyio

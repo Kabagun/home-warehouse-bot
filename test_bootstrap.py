@@ -312,7 +312,8 @@ async def test_real_stdio_works_after_operator_initialization(tmp_path, mode, co
     )
     async with Client(parameters, mode=mode) as connected:
         names = {tool.name for tool in (await connected.list_tools()).tools}
-        assert len(names) == 12 and "init" not in names and "bootstrap" not in names
+        assert len(names) == 16 and "init" not in names and "bootstrap" not in names
+        assert {"preview_deletion", "delete_item", "delete_store", "delete_household"} <= names
         homes = await connected.call_tool("list_households", {})
         assert not homes.is_error
         home = homes.structured_content["households"][0]

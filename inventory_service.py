@@ -176,6 +176,25 @@ class InventoryService:
             return item
         return require_updated(self.storage.restore_item(item.store_id, self.chat_id, item.id))
 
+    def preview_deletion(self, target_type: str, target_id: int) -> dict:
+        self.require_user()
+        return self.storage.preview_deletion(self.chat_id, target_type, target_id)
+
+    def delete_item(self, item_id: int, preview_token: str, confirmed: bool = False) -> dict:
+        return self._delete_reviewed("item", item_id, preview_token, confirmed)
+
+    def delete_store(self, store_id: int, preview_token: str, confirmed: bool = False) -> dict:
+        return self._delete_reviewed("store", store_id, preview_token, confirmed)
+
+    def delete_household(self, household_id: int, preview_token: str, confirmed: bool = False) -> dict:
+        return self._delete_reviewed("household", household_id, preview_token, confirmed)
+
+    def _delete_reviewed(self, target_type: str, target_id: int, preview_token: str, confirmed: bool) -> dict:
+        if confirmed is not True:
+            raise ValueError("Подтвердите удаление после проверки предпросмотра.")
+        self.require_user()
+        return self.storage.delete_reviewed(self.chat_id, target_type, target_id, preview_token)
+
 
 def clean_name(value: str) -> str:
     result = " ".join(value.split())

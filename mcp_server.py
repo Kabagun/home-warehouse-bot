@@ -18,12 +18,12 @@ from contextlib import closing
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Annotated, Any, ParamSpec, TypeVar
+from typing import Annotated, Any, Literal, ParamSpec, TypeVar
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from inventory_service import InventoryService
 from storage import Household, InventoryItem, Storage, Store
@@ -282,6 +282,46 @@ class ShoppingResult(BaseModel):
     stores: list[ShoppingStoreResult]
 
 
+class DeletionStoreResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    name: str
+
+
+class DeletionPreviewResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preview_token: str
+    target_type: Literal["item", "store", "household"]
+    target_id: int
+    name: str
+    household_id: int
+    household_name: str
+    stores: list[DeletionStoreResult] = Field(description="Stores containing the affected inventory; an item includes its store for context.")
+    active_items: int = Field(ge=0)
+    archived_items: int = Field(ge=0)
+    events: int = Field(ge=0)
+    members: int = Field(ge=0, description="Current household member count; no member identities are returned.")
+    shared: bool
+    expires_at: int = Field(description="Unix timestamp in seconds when this single-use preview token expires.")
+
+
+class DeletionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_type: Literal["item", "store", "household"]
+    target_id: int
+    name: str
+    household_id: int
+    deleted: Literal[True]
+    stores: int = Field(ge=0, description="Number of stores actually deleted; zero for a single item.")
+    active_items: int = Field(ge=0)
+    archived_items: int = Field(ge=0)
+    events: int = Field(ge=0)
+    members: int = Field(ge=0, description="Membership rows actually deleted; zero unless a household was deleted.")
+
+
 def household_result(household: Household) -> HouseholdResult:
     # Deliberately omit invite codes, ownership IDs, and member profiles.
     return HouseholdResult(id=household.id, name=household.name)
@@ -336,11 +376,15 @@ SET = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hi
 RESTORE = ToolAnnotations(
     read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False
 )
+DELETE = ToolAnnotations(
+    read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=False
+)
 
 ObjectId = Annotated[int, Field(gt=0, strict=True, description="ID returned by an inventory tool.")]
 Quantity = Annotated[float, Field(ge=0, allow_inf_nan=False, strict=True)]
 Delta = Annotated[float, Field(allow_inf_nan=False, strict=True)]
 Name = Annotated[str, Field(min_length=1)]
+PreviewToken = Annotated[str, Field(min_length=1, strict=True, description="Single-use token from preview_deletion for this exact target and current scope.")]
 
 
 def build_server(storage: Storage, user_id: int, *, profile_id: str | None = None) -> MCPServer:
@@ -352,7 +396,14 @@ def build_server(storage: Storage, user_id: int, *, profile_id: str | None = Non
             "Manage the configured user's home inventory. First list households, then stores and items. "
             "IDs are scoped by household membership. Omitted units use the existing item's unit, or шт "
             "for a new item. Read data is current SQLite state. "
-            "Archived items must be restored before editing; adding their exact name instead starts new stock."
+            "Archived items must be restored before editing; adding their exact name instead starts new stock. "
+            "For irreversible deletion, resolve exact IDs and call preview_deletion. Review the named target, "
+            "active and archived items, history, and shared-home impact with the user. Delete only the exact "
+            "scope explicitly approved by the human, using its current preview token and confirmed=true. "
+            "A prior explicit approval of that same reviewed scope remains valid; do not ask redundantly. "
+            "The confirmation flag records approval supplied by the caller; it does not verify human identity. "
+            "Preview tokens expire after ten minutes, are single-use, and fail if the affected scope changes. "
+            "After a deletion timeout, read current inventory before any further write; never blindly retry."
         ),
         log_level="WARNING",
     )
@@ -463,6 +514,50 @@ def build_server(storage: Storage, user_id: int, *, profile_id: str | None = Non
                 for store, items in service.shopping_list(household_id)
             ],
         )
+
+    @server.tool(annotations=READ)
+    @domain_errors
+    def preview_deletion(target_type: Literal["item", "store", "household"], target_id: ObjectId) -> DeletionPreviewResult:
+        """Preview irreversible deletion without changing inventory; return scope and a ten-minute single-use token.
+
+        Includes active and archived items, event history, and shared-home impact.
+        Resolve exact IDs first and obtain explicit approval for this reviewed scope.
+        Only the owner may preview deletion of a whole home. Deleting its last store is rejected.
+        """
+        return DeletionPreviewResult.model_validate(service.preview_deletion(target_type, target_id))
+
+    @server.tool(annotations=DELETE)
+    @domain_errors
+    def delete_item(item_id: ObjectId, preview_token: PreviewToken, confirmed: StrictBool = False) -> DeletionResult:
+        """Permanently delete the exact approved item and its history, including archived stock.
+
+        Requires its current preview token and confirmed=true after explicit human approval.
+        Omitted/false confirmation never deletes. A token is single-use; after a timeout,
+        read current inventory first and never blindly retry the write.
+        """
+        return DeletionResult.model_validate(service.delete_item(item_id, preview_token, confirmed=confirmed))
+
+    @server.tool(annotations=DELETE)
+    @domain_errors
+    def delete_store(store_id: ObjectId, preview_token: PreviewToken, confirmed: StrictBool = False) -> DeletionResult:
+        """Permanently delete the exact approved store, all active/archived items, and their history.
+
+        Requires its current preview token and confirmed=true after explicit human approval
+        of the complete cascade. Omitted/false confirmation never deletes. The last store
+        cannot be deleted. After a timeout, read current inventory first; never blindly retry.
+        """
+        return DeletionResult.model_validate(service.delete_store(store_id, preview_token, confirmed=confirmed))
+
+    @server.tool(annotations=DELETE)
+    @domain_errors
+    def delete_household(household_id: ObjectId, preview_token: PreviewToken, confirmed: StrictBool = False) -> DeletionResult:
+        """Owner-only irreversible deletion of the approved home, its stores, all items, history, and memberships.
+
+        Requires its current preview token and confirmed=true after explicit human approval
+        of the full shared-home impact. Omitted/false confirmation never deletes. It does
+        not merely leave the home. After a timeout, read current inventory first; never blindly retry.
+        """
+        return DeletionResult.model_validate(service.delete_household(household_id, preview_token, confirmed=confirmed))
 
     return server
 

@@ -98,6 +98,7 @@ async def test_tools_have_structured_schemas_annotations_and_no_identity_argumen
     assert set(by_name) == {
         "list_households", "create_household", "list_stores", "create_store", "list_items", "add_item",
         "change_item_quantity", "set_item_quantity", "set_item_minimum", "archive_item", "restore_item", "shopping_list",
+        "preview_deletion", "delete_item", "delete_store", "delete_household",
     }
     for tool in tools:
         assert tool.output_schema
@@ -114,6 +115,19 @@ async def test_tools_have_structured_schemas_annotations_and_no_identity_argumen
     assert by_name["restore_item"].annotations.idempotent_hint is True
     assert set(by_name["create_store"].input_schema["properties"]) == {"household_id", "name"}
     assert set(by_name["create_store"].output_schema["properties"]) == {"id", "household_id", "name"}
+    assert by_name["preview_deletion"].annotations.read_only_hint is True
+    assert by_name["preview_deletion"].input_schema["properties"]["target_type"]["enum"] == ["item", "store", "household"]
+    assert by_name["preview_deletion"].output_schema["additionalProperties"] is False
+    for name, target in (("delete_item", "item_id"), ("delete_store", "store_id"), ("delete_household", "household_id")):
+        tool = by_name[name]
+        assert tool.annotations.read_only_hint is False
+        assert tool.annotations.destructive_hint is True
+        assert tool.annotations.idempotent_hint is False
+        assert set(tool.input_schema["properties"]) == {target, "preview_token", "confirmed"}
+        assert set(tool.input_schema["required"]) == {target, "preview_token"}
+        assert tool.input_schema["properties"]["confirmed"]["type"] == "boolean"
+        assert tool.input_schema["properties"]["confirmed"]["default"] is False
+        assert tool.output_schema["additionalProperties"] is False
 
 
 @pytest.mark.anyio
@@ -122,7 +136,7 @@ async def test_profile_tool_is_flat_strict_readonly_and_uses_configured_identity
     before = storage.path.read_bytes()
     async with Client(build_server(storage, 101, profile_id=PROFILE_ID)) as connected:
         tools = (await connected.list_tools()).tools
-        assert len(tools) == 13
+        assert len(tools) == 17
         profile_tool = next(tool for tool in tools if tool.name == "get_profile")
         assert profile_tool.meta == {"openai/profile": True, "securitySchemes": [{"type": "oauth2", "scopes": ["inventory"]}]}
         assert profile_tool.input_schema["properties"] == {}
@@ -240,6 +254,76 @@ async def test_archived_items_require_restore_and_keep_stock(client, inventory):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("target_type", ["item", "store", "household"])
+async def test_deletion_requires_strict_approval_and_returns_private_scoped_receipt(client, inventory, target_type):
+    storage, home, store, *_ = inventory
+    storage.join_household(202, home.invite_code)
+    active = await call(client, "add_item", store_id=store.id, name="Active stock", quantity=2)
+    archived = await call(client, "add_item", store_id=store.id, name="Archived stock", quantity=3)
+    await call(client, "archive_item", item_id=archived["id"])
+    target_id = {"item": archived["id"], "store": store.id, "household": home.id}[target_type]
+    before_stores = storage.list_stores(home.id)
+    before_items = storage.list_items(store.id, include_inactive=True)
+    preview = await call(client, "preview_deletion", target_type=target_type, target_id=target_id)
+    assert set(preview) == {
+        "preview_token", "target_type", "target_id", "name", "household_id", "household_name", "stores",
+        "active_items", "archived_items", "events", "members", "shared", "expires_at",
+    }
+    assert (preview["target_type"], preview["target_id"], preview["household_id"]) == (target_type, target_id, home.id)
+    assert preview["household_name"] == home.name
+    assert preview["members"] == 2 and preview["shared"] is True
+    assert preview["active_items"] == (0 if target_type == "item" else 1)
+    assert preview["archived_items"] == 1 and preview["events"] >= 2
+    assert preview["preview_token"] and preview["expires_at"] > 0
+    assert all(set(affected) == {"id", "name"} for affected in preview["stores"])
+    assert "invite_code" not in json.dumps(preview) and "other_user" not in json.dumps(preview)
+    tool_name = f"delete_{target_type}"
+    arguments = {f"{target_type}_id": target_id, "preview_token": preview["preview_token"]}
+    for confirmation in ({}, {"confirmed": False}, {"confirmed": 1}, {"confirmed": 0}, {"confirmed": "true"}, {"confirmed": "false"}, {"confirmed": None}):
+        result = await client.call_tool(tool_name, {**arguments, **confirmation})
+        assert result.is_error, confirmation
+        assert storage.list_stores(home.id) == before_stores
+        assert storage.list_items(store.id, include_inactive=True) == before_items
+    receipt = await call(client, tool_name, **arguments, confirmed=True)
+    assert receipt == {
+        "target_type": target_type, "target_id": target_id, "name": preview["name"], "household_id": home.id,
+        "deleted": True, "stores": {"item": 0, "store": 1, "household": len(before_stores)}[target_type],
+        "active_items": preview["active_items"], "archived_items": preview["archived_items"],
+        "events": preview["events"], "members": 2 if target_type == "household" else 0,
+    }
+    assert storage.get_item(archived["id"]) is None
+    if target_type == "item":
+        assert storage.get_item(active["id"]) is not None
+    else:
+        assert storage.get_item(active["id"]) is None
+    assert (await client.call_tool(tool_name, {**arguments, "confirmed": True})).is_error
+
+
+@pytest.mark.anyio
+async def test_deletion_tokens_cannot_select_another_target_and_preview_arguments_are_strict(client, inventory):
+    storage, _, store, *_ = inventory
+    first = await call(client, "add_item", store_id=store.id, name="First", quantity=1)
+    second = await call(client, "add_item", store_id=store.id, name="Second", quantity=2)
+    for arguments in (
+        {"target_type": "all", "target_id": first["id"]},
+        {"target_type": "item", "target_id": True},
+        {"target_type": "item", "target_id": str(first["id"])},
+        {"target_type": "item", "target_id": first["id"], "user_id": 202},
+    ):
+        assert (await client.call_tool("preview_deletion", arguments)).is_error
+    preview = await call(client, "preview_deletion", target_type="item", target_id=first["id"])
+    for arguments in (
+        {"item_id": second["id"], "preview_token": preview["preview_token"], "confirmed": True},
+        {"item_id": first["id"], "preview_token": preview["preview_token"], "confirmed": True, "user_id": 202},
+        {"item_id": first["id"], "preview_token": preview["preview_token"], "confirmed": True, "database_path": "other.sqlite3"},
+    ):
+        assert (await client.call_tool("delete_item", arguments)).is_error
+    assert storage.get_item(first["id"]) is not None and storage.get_item(second["id"]) is not None
+    await call(client, "delete_item", item_id=first["id"], preview_token=preview["preview_token"], confirmed=True)
+    assert storage.get_item(first["id"]) is None and storage.get_item(second["id"]) is not None
+
+
+@pytest.mark.anyio
 async def test_every_tool_scopes_foreign_ids_to_membership(client, inventory):
     storage, _, _, other_home, other_store, other_item = inventory
     original_stores = storage.list_stores(other_home.id)
@@ -254,6 +338,12 @@ async def test_every_tool_scopes_foreign_ids_to_membership(client, inventory):
         ("set_item_minimum", {"item_id": other_item.id, "min_quantity": 5}),
         ("archive_item", {"item_id": other_item.id}),
         ("restore_item", {"item_id": other_item.id}),
+        ("preview_deletion", {"target_type": "item", "target_id": other_item.id}),
+        ("preview_deletion", {"target_type": "store", "target_id": other_store.id}),
+        ("preview_deletion", {"target_type": "household", "target_id": other_home.id}),
+        ("delete_item", {"item_id": other_item.id, "preview_token": "untrusted-token", "confirmed": True}),
+        ("delete_store", {"store_id": other_store.id, "preview_token": "untrusted-token", "confirmed": True}),
+        ("delete_household", {"household_id": other_home.id, "preview_token": "untrusted-token", "confirmed": True}),
     )
     for name, arguments in attempts:
         result = await client.call_tool(name, arguments)
@@ -272,12 +362,15 @@ async def test_identity_cannot_be_overridden_and_revoked_membership_is_checked(c
     result = await client.call_tool("list_items", {"store_id": other_store.id, "user_id": 202})
     assert result.is_error
     item = await call(client, "add_item", store_id=store.id, name="Rice", quantity=2)
+    preview = await call(client, "preview_deletion", target_type="item", target_id=item["id"])
     with sqlite3.connect(storage.path) as connection:
         connection.execute("DELETE FROM household_members WHERE household_id=? AND chat_id=?", (home.id, 101))
     assert (await call(client, "list_households"))["households"] == []
     for tool, arguments in (
         ("list_items", {"store_id": store.id}),
         ("archive_item", {"item_id": item["id"]}),
+        ("preview_deletion", {"target_type": "item", "target_id": item["id"]}),
+        ("delete_item", {"item_id": item["id"], "preview_token": preview["preview_token"], "confirmed": True}),
     ):
         assert (await client.call_tool(tool, arguments)).is_error
     assert storage.get_item(item["id"]).active
@@ -338,6 +431,8 @@ async def test_stdio_initialization_discovery_and_call(inventory, mode):
     async with Client(parameters, mode=mode) as connected:
         names = {tool.name for tool in (await connected.list_tools()).tools}
         assert "add_item" in names and "shopping_list" in names
+        assert len(names) == 16
+        assert {"preview_deletion", "delete_item", "delete_store", "delete_household"} <= names
         homes = await call(connected, "list_households")
         assert homes["households"][0]["id"] == home.id
         named_store = await call(connected, "create_store", household_id=home.id, name="Морозилка")
@@ -348,7 +443,12 @@ async def test_stdio_initialization_discovery_and_call(inventory, mode):
         assert items["items"][0]["name"] == "Pasta"
         override = await connected.call_tool("list_items", {"store_id": store.id, "chat_id": 202})
         assert override.is_error
+        disposable = await call(connected, "add_item", store_id=named_store["id"], name="Disposable", quantity=1)
+        preview = await call(connected, "preview_deletion", target_type="item", target_id=disposable["id"])
+        receipt = await call(connected, "delete_item", item_id=disposable["id"], preview_token=preview["preview_token"], confirmed=True)
+        assert receipt["deleted"] is True and receipt["target_id"] == disposable["id"]
     assert storage.get_item(added["id"]).quantity == 3
+    assert storage.get_item(disposable["id"]) is None
 
 
 def test_cli_help_and_configuration_errors_and_transport_independent_import(tmp_path):

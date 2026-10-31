@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import Mock
 
 import pytest
@@ -76,7 +77,7 @@ async def test_complete_public_oauth_flow_opens_scoped_mcp_and_keeps_static_bear
 
 
 @pytest.mark.anyio
-async def test_refresh_and_revocation_immediately_change_mcp_access(combined_app, oauth):
+async def test_refresh_preserves_existing_access_and_revocation_invalidates_family(combined_app, oauth):
     async with http_client(combined_app) as http:
         registration = await register(http)
         issued, *_ = await tokens(http, oauth, registration)
@@ -86,22 +87,55 @@ async def test_refresh_and_revocation_immediately_change_mcp_access(combined_app
         })
         assert rotated.status_code == 200
         renewed = rotated.json()
-        expired_access = await http.post("/mcp", headers={"Authorization": "Bearer " + issued["access_token"]}, json={})
-        assert expired_access.status_code == 401
-        http.headers["Authorization"] = "Bearer " + renewed["access_token"]
-        async with Client(streamable_http_client(RESOURCE, http_client=http)) as connected:
-            assert {tool.name for tool in (await connected.list_tools()).tools} == TOOL_NAMES
+        for access in (issued["access_token"], renewed["access_token"]):
+            http.headers["Authorization"] = "Bearer " + access
+            async with Client(streamable_http_client(RESOURCE, http_client=http)) as connected:
+                assert {tool.name for tool in (await connected.list_tools()).tools} == TOOL_NAMES
         del http.headers["Authorization"]
         revoked = await http.post("/revoke", data={
             "client_id": registration["client_id"], "token": renewed["refresh_token"],
             "token_type_hint": "refresh_token",
         })
         assert revoked.status_code == 200
-        denied = await http.post("/mcp", headers={"Authorization": "Bearer " + renewed["access_token"]}, json={})
-        assert denied.status_code == 401
+        for access in (issued["access_token"], renewed["access_token"]):
+            denied = await http.post("/mcp", headers={"Authorization": "Bearer " + access}, json={})
+            assert denied.status_code == 401
         http.headers["Authorization"] = "Bearer " + TOKEN
         async with Client(streamable_http_client(RESOURCE, http_client=http)) as connected:
             assert len((await connected.list_tools()).tools) == 12
+
+
+@pytest.mark.anyio
+async def test_old_access_opens_mcp_while_refresh_response_is_in_transit(combined_app, oauth, monkeypatch):
+    committed, release = asyncio.Event(), asyncio.Event()
+    exchange = oauth.exchange_refresh_token
+
+    async def delay_response(*args):
+        result = await exchange(*args)
+        committed.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(oauth, "exchange_refresh_token", delay_response)
+    async with http_client(combined_app) as http:
+        registration = await register(http)
+        issued, *_ = await tokens(http, oauth, registration)
+        refreshing = asyncio.create_task(http.post("/token", data={
+            "grant_type": "refresh_token", "client_id": registration["client_id"],
+            "refresh_token": issued["refresh_token"], "resource": RESOURCE,
+        }))
+        try:
+            await asyncio.wait_for(committed.wait(), timeout=5)
+            assert not refreshing.done()
+            http.headers["Authorization"] = "Bearer " + issued["access_token"]
+            async with Client(streamable_http_client(RESOURCE, http_client=http)) as connected:
+                assert {tool.name for tool in (await connected.list_tools()).tools} == TOOL_NAMES
+        finally:
+            http.headers.pop("Authorization", None)
+            release.set()
+            rotated = await asyncio.wait_for(refreshing, timeout=5)
+        assert rotated.status_code == 200
+        assert await oauth.verify_token(rotated.json()["access_token"])
 
 
 @pytest.mark.anyio

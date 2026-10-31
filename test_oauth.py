@@ -183,6 +183,97 @@ async def test_authorization_code_only_registration_uses_sdk_without_refresh(cli
 
 
 @pytest.mark.anyio
+async def test_five_day_refresh_keeps_legacy_registration_for_reconnect_and_further_refresh(client, provider, monkeypatch):
+    registration = await register(client)
+    issued, *_ = await tokens(client, provider, registration)
+    now = int(mcp_oauth.time.time())
+    # Existing deployments used a one-day expiry even for approved clients.
+    with provider._db() as db:
+        db.execute("UPDATE clients SET expires_at = ?", (now + 86400,))
+    monkeypatch.setattr(mcp_oauth.time, "time", lambda: now + 5 * 86400)
+    for _ in range(2):
+        response = await client.post("/token", data={
+            "grant_type": "refresh_token", "client_id": registration["client_id"],
+            "refresh_token": issued["refresh_token"], "resource": RESOURCE,
+        })
+        assert response.status_code == 200, response.text
+        issued = response.json()
+        assert await provider.verify_token(issued["access_token"])
+        assert await provider.get_client(registration["client_id"]) is not None
+    assert (await begin(client, registration))[1].status_code == 200
+    with provider._db() as db:
+        assert db.execute("SELECT expires_at FROM clients").fetchone()[0] == mcp_oauth.APPROVED_CLIENT_EXPIRY
+        assert db.execute("SELECT COUNT(*) FROM grants g LEFT JOIN clients c USING (client_id) WHERE c.client_id IS NULL").fetchone()[0] == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cleanup", ["expiry", "revocation"])
+@pytest.mark.parametrize("grant_types", [["authorization_code"], ["authorization_code", "refresh_token"]])
+async def test_approved_registration_survives_grant_cleanup_and_restart(client, provider, monkeypatch, cleanup, grant_types):
+    registration = await register(client, grant_types=grant_types)
+    issued, *_ = await tokens(client, provider, registration)
+    if cleanup == "revocation":
+        response = await client.post("/revoke", data={
+            "client_id": registration["client_id"], "token": issued["access_token"],
+            "token_type_hint": "access_token",
+        })
+        assert response.status_code == 200
+    else:
+        with provider._db() as db:
+            db.execute("UPDATE grants SET access_expires = 0, refresh_expires = 0")
+    future = int(mcp_oauth.time.time()) + 31 * 86400
+    monkeypatch.setattr(mcp_oauth.time, "time", lambda: future)
+    restarted = OAuthProvider(provider.database_path, ISSUER)
+    assert await restarted.get_client(registration["client_id"]) is not None
+    assert not await restarted.verify_token(issued["access_token"])
+    with restarted._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM grants").fetchone()[0] == 0
+    # Reauthorization must still use the normal owner-code consent flow.
+    renewed, *_ = await tokens(client, restarted, registration)
+    assert await restarted.verify_token(renewed["access_token"])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("evidence", ["grant", "code"])
+async def test_legacy_approved_registration_is_pinned_before_expired_evidence_is_collected(client, provider, evidence):
+    registration = await register(client)
+    if evidence == "grant":
+        await tokens(client, provider, registration)
+    else:
+        await approve(client, provider, registration)
+    with provider._db() as db:
+        db.execute("UPDATE clients SET expires_at = 1")
+        db.execute("UPDATE grants SET access_expires = 1, refresh_expires = 1")
+        db.execute("UPDATE codes SET expires_at = 1")
+    restarted = OAuthProvider(provider.database_path, ISSUER)
+    assert await restarted.get_client(registration["client_id"]) is not None
+    with restarted._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM grants").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM codes").fetchone()[0] == 0
+        assert db.execute("SELECT expires_at FROM clients").fetchone()[0] == mcp_oauth.APPROVED_CLIENT_EXPIRY
+
+
+@pytest.mark.anyio
+async def test_unused_registration_expires_without_bypassing_client_capacity(client, provider, monkeypatch):
+    monkeypatch.setattr(mcp_oauth, "MAX_CLIENTS", 1)
+    registration = await register(client)
+    rejected = await client.post("/register", json={"redirect_uris": [CALLBACK]})
+    assert rejected.status_code == 400
+    now = int(mcp_oauth.time.time())
+    monkeypatch.setattr(mcp_oauth.time, "time", lambda: now + mcp_oauth.UNAPPROVED_CLIENT_TTL + 1)
+    assert await provider.get_client(registration["client_id"]) is None
+    response = await client.get("/authorize", params={
+        "client_id": registration["client_id"], "redirect_uri": CALLBACK,
+        "response_type": "code", "code_challenge": CHALLENGE, "resource": RESOURCE,
+    })
+    assert response.status_code == 400 and response.json() == {"error": "invalid_request"}
+    replacement = await register(client)
+    assert replacement["client_id"] != registration["client_id"]
+    with provider._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM clients").fetchone()[0] == 1
+
+
+@pytest.mark.anyio
 async def test_pkce_client_redirect_resource_and_scope_cannot_be_changed(client, provider):
     registration, other = await register(client), await register(client)
     code, _ = await approve(client, provider, registration)
@@ -317,12 +408,41 @@ async def test_refresh_rotation_replay_revokes_family_and_other_client_cannot_re
     renewed = rotated.json()
     assert renewed["access_token"] != result["access_token"]
     assert renewed["refresh_token"] != result["refresh_token"]
-    assert not await provider.verify_token(result["access_token"])
+    assert await provider.verify_token(result["access_token"])
     assert await provider.verify_token(renewed["access_token"])
     assert (await client.post("/token", data=request)).status_code == 400
     assert not await provider.verify_token(renewed["access_token"])
+    assert not await provider.verify_token(result["access_token"])
     owner = await provider.get_client(registration["client_id"])
     assert await provider.load_refresh_token(owner, renewed["refresh_token"]) is None
+
+
+@pytest.mark.anyio
+async def test_rotated_access_keeps_original_expiry_and_family_revocation(client, provider, monkeypatch):
+    registration = await register(client)
+    issued, *_ = await tokens(client, provider, registration)
+    now = int(mcp_oauth.time.time())
+    clock = [now + mcp_oauth.ACCESS_TTL - 5]
+    monkeypatch.setattr(mcp_oauth.time, "time", lambda: clock[0])
+    rotated = await client.post("/token", data={
+        "grant_type": "refresh_token", "client_id": registration["client_id"],
+        "refresh_token": issued["refresh_token"], "resource": RESOURCE,
+    })
+    assert rotated.status_code == 200
+    renewed = rotated.json()
+    assert await provider.verify_token(issued["access_token"])
+    assert await provider.verify_token(renewed["access_token"])
+    clock[0] += 6
+    assert not await provider.verify_token(issued["access_token"])
+    assert await provider.verify_token(renewed["access_token"])
+    assert await provider.get_client(registration["client_id"]) is not None
+    with provider._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM grants").fetchone()[0] == 1
+    revoked = await client.post("/revoke", data={
+        "client_id": registration["client_id"], "token": renewed["refresh_token"],
+    })
+    assert revoked.status_code == 200
+    assert not await provider.verify_token(renewed["access_token"])
 
 
 @pytest.mark.anyio

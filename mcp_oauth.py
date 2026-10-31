@@ -51,6 +51,8 @@ from mcp_server import ConfigurationError
 SCOPE = "inventory"
 ACCESS_TTL = 3600
 REFRESH_TTL = 30 * 86400
+UNAPPROVED_CLIENT_TTL = 86400
+APPROVED_CLIENT_EXPIRY = 0
 CODE_TTL = 300
 CONSENT_TTL = 600
 MAX_ATTEMPTS = 5
@@ -356,10 +358,15 @@ class OAuthProvider(OAuthAuthorizationServerProvider[_AuthorizationCode, _Refres
     @staticmethod
     def _gc(db):
         now = int(time.time())
+        # Client registrations outlive their owner-approved grants. Pin legacy
+        # registrations before removing expired grant/code evidence as well.
+        db.execute("""UPDATE clients SET expires_at = ? WHERE expires_at > 0 AND client_id IN (
+            SELECT client_id FROM grants UNION SELECT client_id FROM codes
+        )""", (APPROVED_CLIENT_EXPIRY,))
         for table in ("pending", "owner_codes", "codes", "refresh_history"):
             db.execute(f"DELETE FROM {table} WHERE expires_at <= ?", (now,))
         db.execute("DELETE FROM grants WHERE refresh_expires <= ?", (now,))
-        db.execute("DELETE FROM clients WHERE expires_at <= ? AND client_id NOT IN (SELECT client_id FROM grants)", (now,))
+        db.execute("DELETE FROM clients WHERE expires_at > 0 AND expires_at <= ?", (now,))
 
     def _rate(self, category, maximum, window):
         now = int(time.time())
@@ -402,7 +409,7 @@ class OAuthProvider(OAuthAuthorizationServerProvider[_AuthorizationCode, _Refres
                 raise RegistrationError("invalid_client_metadata", "Registration capacity reached")
             db.execute("INSERT INTO clients VALUES (?, ?, ?, ?)", (
                 client_info.client_id, client_info.model_copy(update={"client_secret": None}).model_dump_json(),
-                _hash(client_info.client_secret) if client_info.client_secret else None, int(time.time()) + 86400,
+                _hash(client_info.client_secret) if client_info.client_secret else None, int(time.time()) + UNAPPROVED_CLIENT_TTL,
             ))
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
@@ -455,6 +462,11 @@ class OAuthProvider(OAuthAuthorizationServerProvider[_AuthorizationCode, _Refres
             return self._issue(db, client, data["scopes"])
 
     def _issue(self, db, client, scopes, family=None):
+        # Rotation may temporarily leave no refreshable grant. Preserve the
+        # already validated registration before garbage collection observes it.
+        if db.execute("UPDATE clients SET expires_at = ? WHERE client_id = ?",
+                      (APPROVED_CLIENT_EXPIRY, client.client_id)).rowcount != 1:
+            raise TokenError("invalid_grant", "Invalid client")
         self._gc(db)
         if db.execute("SELECT COUNT(*) FROM grants").fetchone()[0] >= MAX_GRANTS:
             raise TokenError("invalid_grant", "Grant capacity reached")
@@ -505,7 +517,10 @@ class OAuthProvider(OAuthAuthorizationServerProvider[_AuthorizationCode, _Refres
                     raise TokenError("invalid_grant", "Refresh capacity reached")
                 db.execute("INSERT INTO refresh_history VALUES (?, ?, ?, ?)",
                            (_hash(refresh_token.token), row["family_hash"], client.client_id, row["refresh_expires"]))
-                db.execute("DELETE FROM grants WHERE refresh_hash = ?", (_hash(refresh_token.token),))
+                # Refresh rotation retires the refresh credential, not access
+                # tokens that other in-flight requests may still be using.
+                db.execute("UPDATE grants SET refresh_hash = NULL, refresh_expires = access_expires WHERE refresh_hash = ?",
+                           (_hash(refresh_token.token),))
                 return self._issue(db, client, scopes, row["family_hash"])
         # Commit family revocation before raising the protocol error.
         raise TokenError("invalid_grant", "Invalid refresh token")
@@ -581,6 +596,8 @@ class OAuthProvider(OAuthAuthorizationServerProvider[_AuthorizationCode, _Refres
             data = params.model_dump(mode="json")
             data.pop("state", None)
             data.update(client_id=row["client_id"], expires_at=int(time.time()) + CODE_TTL, subject="inventory-owner")
+            db.execute("UPDATE clients SET expires_at = ? WHERE client_id = ?",
+                       (APPROVED_CLIENT_EXPIRY, row["client_id"]))
             db.execute("INSERT INTO codes VALUES (?, ?, ?, ?)", (_hash(code), row["client_id"], json.dumps(data), data["expires_at"]))
             db.execute("DELETE FROM owner_codes WHERE code_hash = ?", (owner["code_hash"],))
             db.execute("DELETE FROM pending WHERE nonce_hash = ?", (_hash(nonce),))

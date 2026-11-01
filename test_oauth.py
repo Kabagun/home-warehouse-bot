@@ -635,3 +635,235 @@ def test_operator_cli_outputs_only_single_use_code_and_safe_errors(tmp_path):
                              capture_output=True, text=True, timeout=20)
     assert failure.returncode == 2 and not failure.stdout
     assert str(tmp_path) not in failure.stderr
+
+
+def pending_hash(fields):
+    return hashlib.sha256(fields["request"].encode()).hexdigest()
+
+
+@pytest.mark.anyio
+async def test_operator_approval_get_never_grants_or_renews_then_browser_post_consumes_once(client, provider, monkeypatch):
+    registration = await register(client)
+    fields, page = await begin(client, registration)
+    assert 'name="code"' in page.text
+    owner_code = provider.issue_owner_code()
+    nonce_hash = pending_hash(fields)
+    provider.approve_pending(nonce_hash, registration["client_id"], CALLBACK)
+    with provider._db() as db:
+        approved_until = db.execute("SELECT approved_until FROM pending WHERE nonce_hash = ?", (nonce_hash,)).fetchone()[0]
+        client_before = dict(db.execute("SELECT * FROM clients WHERE client_id = ?", (registration["client_id"],)).fetchone())
+    monkeypatch.setattr(mcp_oauth.time, "time", lambda: approved_until - 1)
+    # A refresh and even HEAD only prepare browser consent and leave approval expiry fixed.
+    for method in ("GET", "HEAD", "GET"):
+        response = await client.request(method, "/oauth/consent", params={"request": fields["request"]})
+        assert response.status_code == 200
+        if method == "GET":
+            assert 'name="code"' not in response.text
+            assert "Владелец подтвердил этот запрос" in response.text
+            fields["csrf"] = re.search(r'name="csrf" value="([^"]+)"', response.text)[1]
+        with provider._db() as db:
+            assert db.execute("SELECT approved_until FROM pending WHERE nonce_hash = ?", (nonce_hash,)).fetchone()[0] == approved_until
+            assert db.execute("SELECT COUNT(*) FROM codes").fetchone()[0] == 0
+            assert db.execute("SELECT COUNT(*) FROM grants").fetchone()[0] == 0
+            assert dict(db.execute("SELECT * FROM clients WHERE client_id = ?", (registration["client_id"],)).fetchone()) == client_before
+    data = {**fields, "decision": "allow"}
+    cookie = client.cookies.get(mcp_oauth._COOKIE)
+    response = await client.post("/oauth/consent", data=data, headers={"Origin": ISSUER})
+    assert response.status_code == 302
+    values = parse_qs(urlsplit(response.headers["location"]).query)
+    assert values["state"] == ["synthetic-state"]
+    assert values["iss"] == [ISSUER]
+    with provider._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM pending WHERE nonce_hash = ?", (nonce_hash,)).fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM owner_codes").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM codes").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM grants").fetchone()[0] == 0
+    replay = await client.post("/oauth/consent", data=data,
+                               headers={"Origin": ISSUER, "Cookie": mcp_oauth._COOKIE + "=" + cookie})
+    assert replay.status_code == 403
+    with pytest.raises(ConfigurationError):
+        provider.approve_pending(nonce_hash, registration["client_id"], CALLBACK)
+    # Normal token checks still bind the approved code to PKCE, callback, client and resource.
+    code = values["code"][0]
+    assert (await exchange(client, registration, code, code_verifier="wrong" + "v" * 43)).status_code == 400
+    assert (await exchange(client, registration, code, redirect_uri=CALLBACK + "/other")).status_code == 400
+    assert (await exchange(client, registration, code, resource="https://other.example.test/mcp")).status_code == 400
+    other = await register(client)
+    assert (await exchange(client, other, code)).status_code == 400
+    assert (await exchange(client, registration, code)).status_code == 200
+    # Existing codes remain an independent alternative for another pending request.
+    assert (await approve(client, provider, registration, owner_code=owner_code))[0]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("case", ["missing", "raw_nonce", "wrong_client", "wrong_redirect", "expired", "exhausted", "unknown_client", "unregistered_redirect"])
+async def test_operator_approval_rejects_wrong_or_inactive_binding_without_changes(client, provider, case):
+    registration = await register(client)
+    fields, _ = await begin(client, registration)
+    nonce_hash, client_id, redirect_uri = pending_hash(fields), registration["client_id"], CALLBACK
+    with provider._db() as db:
+        if case == "expired":
+            db.execute("UPDATE pending SET expires_at = 0")
+        elif case == "exhausted":
+            db.execute("UPDATE pending SET attempts = ?", (mcp_oauth.MAX_ATTEMPTS,))
+        elif case == "unknown_client":
+            db.execute("DELETE FROM clients")
+        elif case == "unregistered_redirect":
+            metadata = json.loads(db.execute("SELECT metadata FROM clients").fetchone()[0])
+            metadata["redirect_uris"] = [CALLBACK + "/other"]
+            db.execute("UPDATE clients SET metadata = ?", (json.dumps(metadata),))
+        before = [dict(row) for row in db.execute("SELECT * FROM pending")]
+    if case == "missing":
+        nonce_hash = "0" * 64
+    elif case == "raw_nonce":
+        nonce_hash = fields["request"]
+    elif case == "wrong_client":
+        client_id += "-other"
+    elif case == "wrong_redirect":
+        redirect_uri += "/"
+    with pytest.raises(ConfigurationError, match="Cannot approve"):
+        provider.approve_pending(nonce_hash, client_id, redirect_uri)
+    with provider._db() as db:
+        assert [dict(row) for row in db.execute("SELECT * FROM pending")] == before
+        assert db.execute("SELECT COUNT(*) FROM codes").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM grants").fetchone()[0] == 0
+
+
+@pytest.mark.anyio
+async def test_operator_approval_preserves_browser_cookie_csrf_origin_and_decision_checks(client, provider):
+    registration = await register(client)
+    fields, _ = await begin(client, registration)
+    nonce_hash = pending_hash(fields)
+    provider.approve_pending(nonce_hash, registration["client_id"], CALLBACK)
+    data = {**fields, "decision": "allow"}
+    cases = [({}, data), ({"Origin": "null"}, data), ({"Origin": "https://attacker.example.test"}, data),
+             ([("Origin", ISSUER), ("Origin", ISSUER)], data),
+             ({"Origin": ISSUER, "Cookie": ""}, data),
+             ({"Origin": ISSUER}, {**data, "csrf": "wrong"})]
+    for headers, altered in cases:
+        assert (await client.post("/oauth/consent", data=altered, headers=headers)).status_code == 403
+    assert (await client.post("/oauth/consent", data={**fields, "decision": "missing"}, headers={"Origin": ISSUER})).status_code == 400
+    with provider._db() as db:
+        row = db.execute("SELECT * FROM pending WHERE nonce_hash = ?", (nonce_hash,)).fetchone()
+        assert row["approved_until"] is not None and row["attempts"] == 0
+        assert db.execute("SELECT COUNT(*) FROM codes").fetchone()[0] == 0
+    assert (await client.post("/oauth/consent", data=data, headers={"Origin": ISSUER})).status_code == 302
+
+
+@pytest.mark.anyio
+async def test_operator_approval_is_per_request_and_deny_removes_it_without_consuming_owner_code(client, provider):
+    registration = await register(client)
+    approved, _ = await begin(client, registration)
+    provider.approve_pending(pending_hash(approved), registration["client_id"], CALLBACK)
+    other, page = await begin(client, registration)
+    assert 'name="code"' in page.text
+    assert (await client.post("/oauth/consent", data={**other, "decision": "allow"}, headers={"Origin": ISSUER})).status_code == 400
+    # A CSRF from the other request cannot spend the approved request.
+    assert (await client.post("/oauth/consent", data={**approved, "csrf": other["csrf"], "decision": "allow"},
+                              headers={"Origin": ISSUER})).status_code == 403
+    owner = provider.issue_owner_code()
+    page = await client.get("/oauth/consent", params={"request": approved["request"]})
+    approved["csrf"] = re.search(r'name="csrf" value="([^"]+)"', page.text)[1]
+    response = await client.post("/oauth/consent", data={**approved, "decision": "deny"}, headers={"Origin": ISSUER})
+    assert response.status_code == 302
+    assert parse_qs(urlsplit(response.headers["location"]).query)["error"] == ["access_denied"]
+    assert all(row["nonce_hash"] != pending_hash(approved) for row in provider.pending_requests())
+    assert (await client.get("/oauth/consent", params={"request": approved["request"]})).status_code == 400
+    assert (await approve(client, provider, registration, owner_code=owner))[0]
+
+
+@pytest.mark.anyio
+async def test_expired_operator_approval_requires_code_and_can_use_owner_code_alternative(client, provider, monkeypatch):
+    registration = await register(client)
+    fields, _ = await begin(client, registration)
+    provider.approve_pending(pending_hash(fields), registration["client_id"], CALLBACK, ttl=1)
+    with provider._db() as db:
+        expires = db.execute("SELECT approved_until FROM pending").fetchone()[0]
+    monkeypatch.setattr(mcp_oauth.time, "time", lambda: expires)
+    page = await client.get("/oauth/consent", params={"request": fields["request"]})
+    assert 'name="code"' in page.text
+    fields["csrf"] = re.search(r'name="csrf" value="([^"]+)"', page.text)[1]
+    assert (await client.post("/oauth/consent", data={**fields, "decision": "allow"}, headers={"Origin": ISSUER})).status_code == 400
+    with provider._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM codes").fetchone()[0] == 0
+    owner = provider.issue_owner_code()
+    assert (await client.post("/oauth/consent", data={**fields, "decision": "allow", "code": owner},
+                              headers={"Origin": ISSUER})).status_code == 302
+
+
+@pytest.mark.anyio
+async def test_operator_approval_is_bounded_not_renewable_by_repeat_and_removed_with_expired_pending(client, provider, monkeypatch):
+    registration = await register(client)
+    fields, _ = await begin(client, registration)
+    nonce_hash = pending_hash(fields)
+    now = int(mcp_oauth.time.time())
+    monkeypatch.setattr(mcp_oauth.time, "time", lambda: now)
+    with provider._db() as db:
+        db.execute("UPDATE pending SET expires_at = ?", (now + 15,))
+    provider.approve_pending(nonce_hash, registration["client_id"], CALLBACK, ttl=600)
+    with provider._db() as db:
+        assert db.execute("SELECT approved_until FROM pending").fetchone()[0] == now + 15
+    with pytest.raises(ConfigurationError):
+        provider.approve_pending(nonce_hash, registration["client_id"], CALLBACK, ttl=600)
+    monkeypatch.setattr(mcp_oauth.time, "time", lambda: now + 15)
+    assert (await client.get("/oauth/consent", params={"request": fields["request"]})).status_code == 400
+    with provider._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM pending").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM codes").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("ttl", [0, -1, 601, True, "300"])
+def test_operator_approval_lifetime_is_bounded(provider, ttl):
+    with pytest.raises(ConfigurationError, match="lifetime"):
+        provider.approve_pending("0" * 64, "synthetic-client", CALLBACK, ttl)
+
+
+@pytest.mark.anyio
+async def test_pending_approval_migration_preserves_legacy_binding_and_is_repeatable(client, provider):
+    registration = await register(client)
+    fields, _ = await begin(client, registration)
+    with provider._db() as db:
+        before = dict(db.execute("SELECT * FROM pending").fetchone())
+        before.pop("approved_until")
+        db.execute("ALTER TABLE pending RENAME TO legacy_pending")
+        db.execute("""CREATE TABLE pending (
+            nonce_hash TEXT PRIMARY KEY, client_id TEXT NOT NULL, params TEXT NOT NULL,
+            csrf_hash TEXT, attempts INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL
+        )""")
+        db.execute("""INSERT INTO pending SELECT nonce_hash, client_id, params, csrf_hash, attempts, expires_at
+                      FROM legacy_pending""")
+        db.execute("DROP TABLE legacy_pending")
+    for _ in range(2):
+        migrated = OAuthProvider(provider.database_path, ISSUER)
+        with migrated._db() as db:
+            after = dict(db.execute("SELECT * FROM pending").fetchone())
+            assert after.pop("approved_until") is None
+            assert after == before
+    migrated.approve_pending(pending_hash(fields), registration["client_id"], CALLBACK)
+    assert (await client.post("/oauth/consent", data={**fields, "decision": "allow"}, headers={"Origin": ISSUER})).status_code == 302
+
+
+@pytest.mark.anyio
+async def test_operator_cli_lists_only_safe_summary_and_approves_exact_request(client, provider, capsys):
+    registration = await register(client)
+    fields, _ = await begin(client, registration)
+    common = ["--data-dir", str(provider.database_path.parent), "--issuer", ISSUER]
+    assert mcp_oauth.main(["pending-list", *common]) == 0
+    output = capsys.readouterr()
+    summary = json.loads(output.out)
+    assert len(summary) == 1
+    assert set(summary[0]) == {"nonce_hash", "client_id", "redirect_uri", "expires_at"}
+    assert summary[0]["nonce_hash"] == pending_hash(fields)
+    assert summary[0]["client_id"] == registration["client_id"]
+    assert summary[0]["redirect_uri"] == CALLBACK
+    assert all(value not in output.out for value in (fields["request"], fields["csrf"], CHALLENGE, "synthetic-state"))
+    assert not output.err
+    binding = ["--nonce-hash", pending_hash(fields), "--client-id", registration["client_id"], "--redirect-uri", CALLBACK]
+    assert mcp_oauth.main(["approve-request", *common, *binding]) == 0
+    output = capsys.readouterr()
+    assert output.out == "Pending request approved. Complete consent in the original browser.\n"
+    assert not output.err
+    assert mcp_oauth.main(["approve-request", *common, *binding]) == 2
+    output = capsys.readouterr()
+    assert not output.out
+    assert all(value not in output.err for value in (str(provider.database_path.parent), registration["client_id"], CALLBACK, pending_hash(fields)))

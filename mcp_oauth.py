@@ -312,7 +312,8 @@ class OAuthProvider(OAuthAuthorizationServerProvider[_AuthorizationCode, _Refres
                     );
                     CREATE TABLE IF NOT EXISTS pending (
                         nonce_hash TEXT PRIMARY KEY, client_id TEXT NOT NULL, params TEXT NOT NULL,
-                        csrf_hash TEXT, attempts INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL
+                        csrf_hash TEXT, attempts INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL,
+                        approved_until INTEGER
                     );
                     CREATE TABLE IF NOT EXISTS owner_codes (
                         code_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0
@@ -331,6 +332,11 @@ class OAuthProvider(OAuthAuthorizationServerProvider[_AuthorizationCode, _Refres
                     );
                     CREATE TABLE IF NOT EXISTS rates (category TEXT PRIMARY KEY, start INTEGER NOT NULL, count INTEGER NOT NULL);
                 """)
+                # Existing pending requests retain their original binding and
+                # expiry. This nullable addition never approves legacy rows.
+                db.execute("BEGIN IMMEDIATE")
+                if "approved_until" not in {row["name"] for row in db.execute("PRAGMA table_info(pending)")}:
+                    db.execute("ALTER TABLE pending ADD COLUMN approved_until INTEGER")
                 db.execute("INSERT OR IGNORE INTO settings VALUES ('issuer', ?)", (self.issuer_url,))
                 if db.execute("SELECT value FROM settings WHERE key = 'issuer'").fetchone()[0] != self.issuer_url:
                     raise ConfigurationError("OAuth state is bound to a different issuer. Use the original issuer or separate OAuth state.")
@@ -392,6 +398,63 @@ class OAuthProvider(OAuthAuthorizationServerProvider[_AuthorizationCode, _Refres
             db.execute("DELETE FROM owner_codes")
             db.execute("INSERT INTO owner_codes VALUES (?, ?, 0)", (_hash(code), int(time.time()) + ttl))
         return code
+
+    def _pending_binding(self, db, row, now):
+        """Recheck the stored request against its live registered client."""
+        if row is None or row["expires_at"] <= now or row["attempts"] >= MAX_ATTEMPTS:
+            return None
+        registered = db.execute("SELECT metadata, expires_at FROM clients WHERE client_id = ?",
+                                (row["client_id"],)).fetchone()
+        if registered is None or (registered["expires_at"] > 0 and registered["expires_at"] <= now):
+            return None
+        try:
+            client = OAuthClientInformationFull.model_validate_json(registered["metadata"])
+            params = AuthorizationParams.model_validate_json(row["params"])
+        except ValueError:
+            return None
+        if (client.client_id != row["client_id"] or params.resource != self.resource_url
+                or params.scopes != [SCOPE] or not _safe_redirect(str(params.redirect_uri))
+                or str(params.redirect_uri) not in [str(uri) for uri in client.redirect_uris or []]
+                or re.fullmatch(r"[A-Za-z0-9_-]{43}", params.code_challenge) is None
+                or (params.state is not None and len(params.state) > 1024)):
+            return None
+        return params, client
+
+    def pending_requests(self) -> list[dict]:
+        """Local operator summaries; never expose raw nonces or PKCE/state."""
+        now = int(time.time())
+        with self._db() as db:
+            summaries = []
+            for row in db.execute("SELECT * FROM pending ORDER BY expires_at, nonce_hash"):
+                binding = self._pending_binding(db, row, now)
+                if binding is not None:
+                    params, _ = binding
+                    summaries.append({"nonce_hash": row["nonce_hash"], "client_id": row["client_id"],
+                                      "redirect_uri": str(params.redirect_uri), "expires_at": row["expires_at"]})
+            return summaries
+
+    def approve_pending(self, nonce_hash: str, client_id: str, redirect_uri: str, ttl: int = 300) -> None:
+        """Authorize only this existing request, for a subsequent browser POST.
+
+        This privileged local operation is deliberately absent from HTTP routes
+        and MCP tools. Pending params are immutable after authorize(); approval
+        shares the row's lifetime and is consumed by its transactional deletion.
+        """
+        if type(ttl) is not int or not 1 <= ttl <= CONSENT_TTL:
+            raise ConfigurationError("Approval lifetime must be between 1 and 600 seconds.")
+        if (not isinstance(nonce_hash, str) or re.fullmatch(r"[0-9a-f]{64}", nonce_hash) is None
+                or not isinstance(client_id, str) or not isinstance(redirect_uri, str)):
+            raise ConfigurationError("Cannot approve this pending request.")
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            now = int(time.time())
+            row = db.execute("SELECT * FROM pending WHERE nonce_hash = ?", (nonce_hash,)).fetchone()
+            binding = self._pending_binding(db, row, now)
+            if (binding is None or row["client_id"] != client_id or str(binding[0].redirect_uri) != redirect_uri
+                    or (row["approved_until"] is not None and row["approved_until"] > now)):
+                raise ConfigurationError("Cannot approve this pending request.")
+            db.execute("UPDATE pending SET approved_until = ? WHERE nonce_hash = ?",
+                       (min(now + ttl, row["expires_at"]), nonce_hash))
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         if (not client_info.redirect_uris or len(client_info.redirect_uris) > 10
@@ -556,12 +619,13 @@ class OAuthProvider(OAuthAuthorizationServerProvider[_AuthorizationCode, _Refres
             with self._db() as db:
                 self._gc(db)
                 row = db.execute("SELECT * FROM pending WHERE nonce_hash = ?", (_hash(nonce),)).fetchone()
-                if row is None or row["attempts"] >= MAX_ATTEMPTS:
+                binding = self._pending_binding(db, row, int(time.time()))
+                if binding is None:
                     return self._error_page("Запрос истёк. Начните подключение заново.")
                 db.execute("UPDATE pending SET csrf_hash = ? WHERE nonce_hash = ?", (_hash(csrf), _hash(nonce)))
-            params = AuthorizationParams.model_validate_json(row["params"])
-            client = await self.get_client(row["client_id"])
-            response = self._consent_page(params, nonce, csrf, client.client_name if client else None)
+            params, client = binding
+            approved = row["approved_until"] is not None and row["approved_until"] > int(time.time())
+            response = self._consent_page(params, nonce, csrf, client.client_name, approved)
             response.set_cookie(_COOKIE, csrf, max_age=CONSENT_TTL, secure=True, httponly=True, samesite="lax", path="/")
             return response
         origins = request.headers.getlist("origin")
@@ -580,18 +644,25 @@ class OAuthProvider(OAuthAuthorizationServerProvider[_AuthorizationCode, _Refres
             if (row is None or row["attempts"] >= MAX_ATTEMPTS or not row["csrf_hash"]
                     or not hmac.compare_digest(_hash(csrf), row["csrf_hash"])):
                 return self._error_page("Запрос истёк или проверка безопасности не пройдена.", 403)
-            params = AuthorizationParams.model_validate_json(row["params"])
+            now = int(time.time())
+            binding = self._pending_binding(db, row, now)
+            if binding is None:
+                return self._error_page("Запрос истёк или проверка безопасности не пройдена.", 403)
+            params, _ = binding
             if form.get("decision") == "deny":
                 db.execute("DELETE FROM pending WHERE nonce_hash = ?", (_hash(nonce),))
                 return self._finish(params, error="access_denied")
             if form.get("decision") != "allow":
                 return self._error_page("Выберите действие.")
             db.execute("UPDATE pending SET attempts = attempts + 1 WHERE nonce_hash = ?", (_hash(nonce),))
-            owner = db.execute("SELECT * FROM owner_codes WHERE code_hash = ? AND attempts < ?",
-                               (_hash(str(form.get("code", ""))), MAX_ATTEMPTS)).fetchone()
-            if owner is None:
-                db.execute("UPDATE owner_codes SET attempts = attempts + 1")
-                return self._error_page("Код недействителен или истёк. Получите новый код владельца.")
+            approved = row["approved_until"] is not None and row["approved_until"] > now
+            owner = None
+            if not approved:
+                owner = db.execute("SELECT * FROM owner_codes WHERE code_hash = ? AND attempts < ?",
+                                   (_hash(str(form.get("code", ""))), MAX_ATTEMPTS)).fetchone()
+                if owner is None:
+                    db.execute("UPDATE owner_codes SET attempts = attempts + 1")
+                    return self._error_page("Код недействителен или истёк. Получите новый код владельца.")
             if db.execute("SELECT COUNT(*) FROM codes").fetchone()[0] >= MAX_PENDING:
                 return self._error_page("Слишком много подключений. Попробуйте позже.", 429)
             code = _opaque()
@@ -601,12 +672,13 @@ class OAuthProvider(OAuthAuthorizationServerProvider[_AuthorizationCode, _Refres
             db.execute("UPDATE clients SET expires_at = ? WHERE client_id = ?",
                        (APPROVED_CLIENT_EXPIRY, row["client_id"]))
             db.execute("INSERT INTO codes VALUES (?, ?, ?, ?)", (_hash(code), row["client_id"], json.dumps(data), data["expires_at"]))
-            db.execute("DELETE FROM owner_codes WHERE code_hash = ?", (owner["code_hash"],))
+            if owner is not None:
+                db.execute("DELETE FROM owner_codes WHERE code_hash = ?", (owner["code_hash"],))
             db.execute("DELETE FROM pending WHERE nonce_hash = ?", (_hash(nonce),))
             return self._finish(params, code=code)
 
     @staticmethod
-    def _consent_page(params, nonce, csrf, client_name):
+    def _consent_page(params, nonce, csrf, client_name, approved=False):
         callback_url = urlsplit(str(params.redirect_uri))
         callback = callback_url.netloc
         callback_origin = f"{callback_url.scheme}://{callback}"
@@ -619,6 +691,11 @@ class OAuthProvider(OAuthAuthorizationServerProvider[_AuthorizationCode, _Refres
         fields = "".join(f'<input type="hidden" name="{name}" value="{html.escape(value, quote=True)}">'
                          for name, value in (("request", nonce), ("csrf", csrf)))
         operations = "".join(f"<li>{html.escape(label)}</li>" for label in _TOOL_SUMMARY)
+        confirmation = (
+            '<p>Владелец подтвердил этот запрос на сервере. Проверьте приложение и нажмите «Разрешить доступ» или «Отказать».</p>'
+            if approved else
+            '<label for="code">Одноразовый код владельца</label><input id="code" name="code" type="password" autocomplete="off" maxlength="128">'
+        )
         page = (
             '<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
             '<title>Доступ к домашним запасам</title><style>body{font:16px system-ui;max-width:620px;margin:40px auto;padding:20px;line-height:1.5}'
@@ -627,7 +704,7 @@ class OAuthProvider(OAuthAuthorizationServerProvider[_AuthorizationCode, _Refres
             f'<p>Приложение: <strong>{html.escape(client_name or "MCP-клиент")}</strong><br>Адрес возврата: {html.escape(callback)}</p>'
             '<p>Приложение получит доступ к запасам настроенного владельца и сможет:</p>'
             f'<ul>{operations}</ul><form method="post" action="/oauth/consent">{fields}'
-            '<label for="code">Одноразовый код владельца</label><input id="code" name="code" type="password" autocomplete="off" maxlength="128">'
+            f'{confirmation}'
             '<button type="submit" name="decision" value="allow">Разрешить доступ</button>'
             '<button type="submit" name="decision" value="deny">Отказать</button></form></main></html>'
         )
@@ -680,17 +757,29 @@ def create_oauth_routes(provider: OAuthProvider) -> list[Route]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Create a short-lived, single-use OAuth owner code.")
+    parser = argparse.ArgumentParser(description="Local operator actions for private OAuth state.")
     subcommands = parser.add_subparsers(dest="command", required=True)
-    owner = subcommands.add_parser("owner-code")
-    owner.add_argument("--data-dir", type=Path, required=True)
-    owner.add_argument("--issuer", required=True)
+    for command in ("owner-code", "pending-list", "approve-request"):
+        operation = subcommands.add_parser(command)
+        operation.add_argument("--data-dir", type=Path, required=True)
+        operation.add_argument("--issuer", required=True)
+        if command == "approve-request":
+            operation.add_argument("--nonce-hash", required=True)
+            operation.add_argument("--client-id", required=True)
+            operation.add_argument("--redirect-uri", required=True)
+            operation.add_argument("--ttl", type=int, default=300)
     arguments = parser.parse_args(argv)
     try:
         provider = OAuthProvider(arguments.data_dir / "oauth.sqlite3", arguments.issuer)
-        print(provider.issue_owner_code())
+        if arguments.command == "owner-code":
+            print(provider.issue_owner_code())
+        elif arguments.command == "pending-list":
+            print(json.dumps(provider.pending_requests(), ensure_ascii=True))
+        else:
+            provider.approve_pending(arguments.nonce_hash, arguments.client_id, arguments.redirect_uri, arguments.ttl)
+            print("Pending request approved. Complete consent in the original browser.")
     except (ConfigurationError, OSError, sqlite3.Error):
-        print("Cannot create an owner code. Check the private data directory and HTTPS issuer.", file=sys.stderr)
+        print("Cannot complete the OAuth operator action. Check private state, issuer, and request binding.", file=sys.stderr)
         return 2
     return 0
 
